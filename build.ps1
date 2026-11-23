@@ -32,7 +32,7 @@ if (![System.IO.Path]::IsPathRooted($KsFile)) { $KsFile = (Resolve-Path (Join-Pa
 if (!$KeyAlias) { $KeyAlias = "flipclock" }
 
 $ManifestText = Get-Content -Raw -Encoding UTF8 (Join-Path $Here "app\src\main\AndroidManifest.xml")
-$Pkg = if ($ManifestText -match 'package="([^"]+)"') { $Matches[1] } else { "io.github.aragamiz.madridsubscreen" }
+$Pkg = if ($ManifestText -match 'package="([^"]+)"') { $Matches[1] } else { "io.github.aragamiz.madrid2flip" }
 $VerCode = if ($ManifestText -match 'android:versionCode="([^"]+)"') { $Matches[1] } else { "0" }
 $Ver = if ($ManifestText -match 'android:versionName="([^"]+)"') { $Matches[1] } else { "unknown" }
 

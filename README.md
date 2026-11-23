@@ -1,4 +1,4 @@
-# MadridSubscreen（小米 18 背屏移植模块）
+# Madrid2flip（小米 18 背屏移植模块）
 
 面向 **Xiaomi MIX Flip 2 (`bixi`, HyperOS 4 / Android 17)** 的独立 Xposed 模块，将小米 18 (`madrid`) 背屏中心（`com.xiaomi.subscreencenter`）移植到 MIX Flip 2 外屏运行。
 

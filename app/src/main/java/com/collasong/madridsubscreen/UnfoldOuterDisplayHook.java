@@ -425,7 +425,7 @@ public final class UnfoldOuterDisplayHook {
         }
         try {
             Intent it = new Intent(RearScreenNotifyReceiver.ACTION_NOTIFY_REAR_TOGGLED);
-            it.setComponent(new ComponentName("io.github.aragamiz.madridsubscreen",
+            it.setComponent(new ComponentName("io.github.aragamiz.madrid2flip",
                     "com.collasong.madridsubscreen.RearScreenNotifyReceiver"));
             it.putExtra(RearScreenNotifyReceiver.EXTRA_ENABLED, enabled);
             it.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);

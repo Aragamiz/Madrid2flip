@@ -1,6 +1,6 @@
 package com.collasong.madridsubscreen;
 
-import io.github.aragamiz.madridsubscreen.R;
+import io.github.aragamiz.madrid2flip.R;
 
 import android.app.Notification;
 import android.app.NotificationChannel;

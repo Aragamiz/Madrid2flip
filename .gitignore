@@ -1,0 +1,10 @@
+keystore.properties
+*.keystore
+*.jks
+release/
+build/
+.gradle/
+.idea/
+*.iml
+*.idsig
+local.properties

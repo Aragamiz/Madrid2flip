@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Madrid(小米18)背屏移植flip2</string>
+    <string name="xposed_desc">小米 18 (madrid) 背屏中心移植至 MIX Flip 2，支持展开态外屏、双摄对齐、背面光感与轻敲背面开关。</string>
+</resources>

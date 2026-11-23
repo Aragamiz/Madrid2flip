@@ -2,7 +2,7 @@
 
 面向 **Xiaomi MIX Flip 2 (`bixi`, HyperOS 4 / Android 17)** 的独立 Xposed 模块，将小米 18 (`madrid`) 背屏中心（`com.xiaomi.subscreencenter`）移植到 MIX Flip 2 外屏运行。
 
-> **前置依赖**：需配合提取自小米 18 OS4 固件的配套资源模块（挂载 `/product/app/subscreencenter`、`/product/media/rearscreen`、`/product/etc/precust_theme/theme/.data`），本仓库仅包含开源 Xposed 适配模块源码与 Release APK，不包含小米原厂闭源资源。
+> **前置依赖（配套系统资源模块）**：需先在 KernelSU / Magisk 中刷入配套的小米 18 背屏系统资源模块（`madrid_subscreen_port_v1.0.0.zip`，用于挂载 `/product/app/subscreencenter`、`/product/media/rearscreen`、`/product/etc/precust_theme/theme/.data`），可在 [Releases 页面](https://github.com/Aragamiz/Madrid2flip/releases) 直接下载；本仓库源码仅包含 Xposed 适配模块本身。
 
 ## 核心特性
 

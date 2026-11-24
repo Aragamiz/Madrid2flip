@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.aragamiz.madrid2flip"
-    android:versionCode="25"
-    android:versionName="1.0.24">
+    android:versionCode="26"
+    android:versionName="1.0.25">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
 
     <application
         android:allowBackup="true"
@@ -27,18 +28,20 @@
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
 
+        <!-- 组件类统一放在应用包名命名空间下（继承原实现），规避 HyperOS 4 组件解析丢弃问题 -->
         <activity
-            android:name="com.collasong.madridsubscreen.SettingsActivity"
+            android:name="io.github.aragamiz.madrid2flip.SettingsLauncher"
             android:exported="true"
             android:label="@string/app_name">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
 
         <service
-            android:name="com.collasong.madridsubscreen.SubscreenTileService"
+            android:name="io.github.aragamiz.madrid2flip.TileServiceLauncher"
             android:exported="true"
             android:icon="@drawable/ic_subscreen_tile"
             android:label="小米18背屏"
@@ -49,7 +52,7 @@
         </service>
 
         <receiver
-            android:name="com.collasong.madridsubscreen.RearScreenNotifyReceiver"
+            android:name="io.github.aragamiz.madrid2flip.NoticeReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="com.collasong.madridsubscreen.ACTION_NOTIFY_REAR_TOGGLED" />

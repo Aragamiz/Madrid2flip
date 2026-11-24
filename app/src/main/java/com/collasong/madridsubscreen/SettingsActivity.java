@@ -299,6 +299,30 @@ public class SettingsActivity extends Activity {
             toast("防烧屏模式：" + BURNIN_LABELS[idx]);
         });
 
+        // 4.5 背屏锁定与壁纸
+        addSectionTitle(root, "背屏锁定与壁纸");
+        LinearLayout lockCard = roundedCard(root, cCard, cStroke, 18, 16);
+
+        addSwitchRow(lockCard,
+                "背屏触摸锁定（防误触）",
+                "展开使用时外屏不再响应任何触摸（含双击退出、左滑自拍）；内屏触控、背屏画面与壁纸均不受影响，关闭后立即恢复。",
+                getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_TOUCH_LOCK, 0) == 1,
+                (b, checked) -> {
+                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_TOUCH_LOCK + " " + (checked ? "1" : "0"));
+                    toast(checked ? "已锁定背屏触摸，外屏不再响应触摸" : "已解除背屏触摸锁定");
+                });
+
+        addDivider(lockCard);
+
+        addSwitchRow(lockCard,
+                "视频壁纸循环播放",
+                "背屏动态壁纸播放到结尾时立即从头重播，不再停在最后一帧；关闭后恢复系统默认的播完暂停。",
+                getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP, 0) == 1,
+                (b, checked) -> {
+                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP + " " + (checked ? "1" : "0"));
+                    toast(checked ? "已开启视频壁纸循环播放" : "已关闭循环，恢复播完暂停");
+                });
+
         // 5. 息屏与自动化卡片
         addSectionTitle(root, "息屏与自动化（方案 A）");
         LinearLayout autoCard = roundedCard(root, cCard, cStroke, 18, 16);
@@ -579,11 +603,46 @@ public class SettingsActivity extends Activity {
     }
 
     private void runRootCmd(final String cmd) {
+        // 优先用 Settings API 直写：不依赖 root 授权，失败率高且无提示的 su 通道只作为兜底。
+        if (cmd != null) {
+            if (cmd.startsWith("settings put global ")) {
+                String rest = cmd.substring("settings put global ".length()).trim();
+                int sp = rest.indexOf(' ');
+                if (sp > 0) {
+                    String key = rest.substring(0, sp);
+                    String val = rest.substring(sp + 1).trim();
+                    try {
+                        Settings.Global.putString(getContentResolver(), key, val);
+                        return;
+                    } catch (Throwable t) {
+                        android.util.Log.w("MadridSettings", "putGlobal " + key + " failed: " + t);
+                        toast("系统设置写入被拒绝，正在改用 root 通道；若仍无反应请在 KernelSU 中授予本应用 root 权限");
+                    }
+                }
+            } else if (cmd.startsWith("settings put system ")) {
+                String rest = cmd.substring("settings put system ".length()).trim();
+                int sp = rest.indexOf(' ');
+                if (sp > 0) {
+                    String key = rest.substring(0, sp);
+                    String val = rest.substring(sp + 1).trim();
+                    try {
+                        Settings.System.putString(getContentResolver(), key, val);
+                        return;
+                    } catch (Throwable t) {
+                        android.util.Log.w("MadridSettings", "putSystem " + key + " failed: " + t);
+                    }
+                }
+            }
+        }
         new Thread(() -> {
             try {
                 Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
-                p.waitFor();
-            } catch (Throwable ignored) {
+                int code = p.waitFor();
+                if (code != 0) {
+                    runOnUiThread(() -> toast("命令执行失败，请确认已在 KernelSU 中授予本应用 root 权限"));
+                }
+            } catch (Throwable t) {
+                runOnUiThread(() -> toast("需要 root 权限才能生效，请在 KernelSU 中授权本应用"));
             }
         }).start();
     }

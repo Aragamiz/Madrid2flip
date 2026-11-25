@@ -179,19 +179,6 @@ public final class SubscreenCenterHook {
         if (cl == null) {
             return;
         }
-        // === 二次开发（背屏锁定 / 视频壁纸循环）===
-        // 原模块的视口重映射（getRealSize → 1208x738、改写 Activity 视图树、毛玻璃背板、防烧屏位移）
-        // 在 HyperOS 4 / Android 17 上会让 SubScreenLauncher 的窗口拿不到 buffer 而整屏黑掉，
-        // 并与当前已正常工作的外屏显示与自定义壁纸相互冲突。
-        // 这里只安装两项新增能力所需的 Hook，显示相关逻辑一律保持原厂，确保不引入回归。
-        boolean legacyViewport = false;
-        if (!legacyViewport) {
-            installRearTouchLock(cl);
-            installRearWindowTouchable(cl);
-            installRearVideoLoop(cl);
-            XposedBridge.log(TAG + ": touch-lock + wallpaper-loop installed, stock viewport preserved");
-            return;
-        }
         try {
             Class<?> infoCls = XposedHelpers.findClass("miui.util.MiuiMultiDisplayTypeInfo", cl);
             try {
@@ -311,6 +298,7 @@ public final class SubscreenCenterHook {
                         sMainHandler.removeCallbacks(sGlassRefreshRunnable);
                         sMainHandler.removeCallbacks(sTimeoutExitRunnable);
                         sMainHandler.removeCallbacks(sTableOffRunnable);
+                        stopTouchLockTicker();
                         unregisterBackProximity();
                         unregisterGravityAutoRotate();
                     }
@@ -374,12 +362,16 @@ public final class SubscreenCenterHook {
                 }
             });
 
+            installRearTouchLock(cl);
+            installRearWindowTouchable(cl);
             installRearVideoLoop(cl);
 
-            XposedBridge.log(TAG + ": camera-aligned viewport + black-area double-tap exit + burn-in shift armed");
+            XposedBridge.log(TAG + ": camera-aligned viewport + black-area double-tap exit + burn-in shift + touch-lock + video-loop armed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": hook Activity viewport failed: " + t);
-            // 触摸/视口 hook 失败时仍要保证壁纸循环可用（其内部逐项 try-catch）
+            // 触摸/视口 hook 失败时仍要保证背屏锁定与壁纸循环可用（其内部逐项 try-catch）
+            installRearTouchLock(cl);
+            installRearWindowTouchable(cl);
             installRearVideoLoop(cl);
         }
     }
@@ -546,24 +538,35 @@ public final class SubscreenCenterHook {
         }
     }
 
-    /** 合盖/展开切换不会重建 Activity，用低频轮询兜住 display 变化引起的状态偏差。 */
+    private static Runnable sTouchLockTickerRunnable;
+
+    /** 合盖/展开切换不会重建 Activity，用低频轮询兜住 display 变化引起的状态偏差；在 onPause 时自动停止避免后台唤醒。 */
     private static void startTouchLockTicker() {
-        if (sTouchLockHandler != null) {
-            return;
+        if (sTouchLockHandler == null) {
+            sTouchLockHandler = new Handler(Looper.getMainLooper());
         }
-        sTouchLockHandler = new Handler(Looper.getMainLooper());
-        sTouchLockHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                Activity a = sRearActRef != null ? sRearActRef.get() : null;
-                if (a != null) {
-                    applyRearWindowTouchable(a);
+        if (sTouchLockTickerRunnable == null) {
+            sTouchLockTickerRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    Activity a = sRearActRef != null ? sRearActRef.get() : null;
+                    if (a != null && !a.isFinishing() && !a.isDestroyed()) {
+                        applyRearWindowTouchable(a);
+                        if (sTouchLockHandler != null) {
+                            sTouchLockHandler.postDelayed(this, 1500L);
+                        }
+                    }
                 }
-                if (sTouchLockHandler != null) {
-                    sTouchLockHandler.postDelayed(this, 1500L);
-                }
-            }
-        }, 1500L);
+            };
+        }
+        sTouchLockHandler.removeCallbacks(sTouchLockTickerRunnable);
+        sTouchLockHandler.postDelayed(sTouchLockTickerRunnable, 1500L);
+    }
+
+    private static void stopTouchLockTicker() {
+        if (sTouchLockHandler != null && sTouchLockTickerRunnable != null) {
+            sTouchLockHandler.removeCallbacks(sTouchLockTickerRunnable);
+        }
     }
 
     private static boolean isRearTouchLocked(Context ctx) {

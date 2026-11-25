@@ -845,12 +845,12 @@ public final class UnfoldOuterDisplayHook {
         if (ctx == null || cl == null) {
             return;
         }
-        ensureSubscreenHookReady(ctx);
         // 二次防呆：合盖状态下绝不允许拉起 state=5，根治合盖外屏黑屏卡死！
         if (sCurrentBaseState == 0 || sCurrentBaseState == 1) {
             XposedBridge.log(TAG + ": aborted enterRearState(" + reason + ") because device is folded (baseId=" + sCurrentBaseState + ")");
             return;
         }
+        ensureSubscreenHookReady(ctx);
         try {
             Class<?> dsmCls = XposedHelpers.findClass("android.hardware.devicestate.DeviceStateManager", cl);
             Object dsm = ctx.getSystemService(dsmCls);

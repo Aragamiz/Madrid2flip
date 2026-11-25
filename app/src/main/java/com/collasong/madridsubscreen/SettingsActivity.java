@@ -615,8 +615,7 @@ public class SettingsActivity extends Activity {
                         Settings.Global.putString(getContentResolver(), key, val);
                         return;
                     } catch (Throwable t) {
-                        android.util.Log.w("MadridSettings", "putGlobal " + key + " failed: " + t);
-                        toast("系统设置写入被拒绝，正在改用 root 通道；若仍无反应请在 KernelSU 中授予本应用 root 权限");
+                        android.util.Log.w("MadridSettings", "putGlobal " + key + " failed, fallback to su: " + t);
                     }
                 }
             } else if (cmd.startsWith("settings put system ")) {

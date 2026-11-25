@@ -323,6 +323,21 @@ public class SettingsActivity extends Activity {
                     toast(checked ? "已开启视频壁纸循环播放" : "已关闭循环，恢复播完暂停");
                 });
 
+        addDivider(lockCard);
+
+        addSwitchRow(lockCard,
+                "弯折支架模式（关内屏只留背屏）",
+                "半展开当支架时自动关闭内屏、只亮背屏展示壁纸；需先开启「半展开自动亮背屏」。展开、合盖或关闭本开关后立即恢复内屏。",
+                getGlobalInt(UnfoldOuterDisplayHook.KEY_HALF_OPEN_INNER_OFF, 0) == 1,
+                (b, checked) -> {
+                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_HALF_OPEN_INNER_OFF + " " + (checked ? "1" : "0"));
+                    try {
+                        sendBroadcast(new Intent(UnfoldOuterDisplayHook.ACTION_APPLY_STAND_MODE));
+                    } catch (Throwable ignored) {
+                    }
+                    toast(checked ? "已开启弯折支架模式，半展开将关闭内屏" : "已关闭弯折支架模式，内屏恢复");
+                });
+
         // 5. 息屏与自动化卡片
         addSectionTitle(root, "息屏与自动化（方案 A）");
         LinearLayout autoCard = roundedCard(root, cCard, cStroke, 18, 16);
@@ -615,7 +630,8 @@ public class SettingsActivity extends Activity {
                         Settings.Global.putString(getContentResolver(), key, val);
                         return;
                     } catch (Throwable t) {
-                        android.util.Log.w("MadridSettings", "putGlobal " + key + " failed, fallback to su: " + t);
+                        android.util.Log.w("MadridSettings", "putGlobal " + key + " failed: " + t);
+                        toast("系统设置写入被拒绝，正在改用 root 通道；若仍无反应请在 KernelSU 中授予本应用 root 权限");
                     }
                 }
             } else if (cmd.startsWith("settings put system ")) {

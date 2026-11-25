@@ -66,7 +66,10 @@ public final class SubscreenCenterHook {
     // 2 = 积极大幅档（12s / 顶部0 ↔ 中部320 ↔ 底部640 大幅轮换整屏位置）
     private static final int[] AGGRESSIVE_POSITIONS = {0, 320, 640, 320};
     private static int sAggressiveIdx = 0;
-    private static final int BACK_PROXIMITY_SENSOR_TYPE = 33171123; // TCS3720ALSPRX Proximity Back Sensor
+    private static final int BACK_PROXIMITY_SENSOR_TYPE = 33171123; // TCS3720ALSPRX Proximity Back Sensor (算法包装值，贴桌时误报 5.0)
+    // 外屏接近传感器的 factory 原始流：贴桌时 v0=1023 满量程饱和，比包装值可靠
+    private static final int BACK_PROX_FACTORY_TYPE = 33171124;   // TCS3720ALSPRX Proximity Back Sensor Strm
+    private static final float BACK_PROX_FACTORY_NEAR = 900f;      // 原始 ADC 阈值：>=900 视为贴桌遮挡
 
     private static long sLastBlackTapTime = 0L;
     private static float sTouchDownX = 0f;
@@ -79,6 +82,7 @@ public final class SubscreenCenterHook {
     private static WeakReference<Activity> sTrackedActivityRef;
     private static SensorManager sSensorManager;
     private static SensorEventListener sBackProxListener;
+    private static volatile Boolean sLastBackProxNear;
     private static android.view.OrientationEventListener sOrientationListener;
     private static int sCurrentContentRotation = 0;
     private static volatile boolean sFinishReceiverRegistered;
@@ -189,7 +193,11 @@ public final class SubscreenCenterHook {
             installRearTouchLock(cl);
             installRearWindowTouchable(cl);
             installRearVideoLoop(cl);
-            XposedBridge.log(TAG + ": touch-lock + wallpaper-loop installed, stock viewport preserved");
+            // 「平放桌面自动关闭外屏」的背面接近传感器注册原本嵌在下方 legacy 分支的
+            // Activity.onResume 里；该分支被提前 return 跳过，导致平放检测从未启动。
+            // 这里单独挂一个只管传感器生命周期的 Hook，不触碰任何视口/显示逻辑。
+            installTableOffProximity(cl);
+            XposedBridge.log(TAG + ": touch-lock + wallpaper-loop + table-off installed, stock viewport preserved");
             return;
         }
         try {
@@ -824,6 +832,43 @@ public final class SubscreenCenterHook {
         }
     }
 
+    /**
+     * 平放桌面自动关闭外屏：独立于视口 Hook 注册背面接近传感器。
+     * <p>
+     * 这段注册逻辑原本只在 legacyViewport 分支的 Activity.onResume 中执行，
+     * 当前设备必须走 !legacyViewport 路径（否则外屏黑屏），导致该功能一直失效。
+     * 这里只挂生命周期回调，不改动任何显示/视口相关代码。
+     */
+    private static void installTableOffProximity(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Activity act = (Activity) param.thisObject;
+                    if (act == null || !isSubScreenActivity(act.getClass().getName())) {
+                        return;
+                    }
+                    sTrackedActivityRef = new WeakReference<>(act);
+                    sMainHandler.post(() -> registerBackProximity(act));
+                }
+            });
+            XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Activity act = (Activity) param.thisObject;
+                    if (act == null || !isSubScreenActivity(act.getClass().getName())) {
+                        return;
+                    }
+                    sMainHandler.removeCallbacks(sTableOffRunnable);
+                    unregisterBackProximity();
+                }
+            });
+            XposedBridge.log(TAG + ": installed table-off back-proximity (independent of legacy viewport)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": installTableOffProximity failed: " + t);
+        }
+    }
+
     private static void registerBackProximity(Activity act) {
         unregisterBackProximity();
         if (act == null) {
@@ -831,32 +876,51 @@ public final class SubscreenCenterHook {
         }
         try {
             if (Settings.Global.getInt(act.getContentResolver(), UnfoldOuterDisplayHook.KEY_REAR_TABLE_OFF, 1) != 1) {
+                XposedBridge.log(TAG + ": registerBackProximity skipped (KEY_REAR_TABLE_OFF=0)");
                 return;
             }
             SensorManager sm = (SensorManager) act.getSystemService(Context.SENSOR_SERVICE);
             if (sm == null) {
                 return;
             }
-            Sensor backProx = sm.getDefaultSensor(BACK_PROXIMITY_SENSOR_TYPE, false);
+            // 优先用外屏接近的原始流 33171124：贴桌时 v0≈1023（满量程饱和）。
+            // 系统包装值 33171123 在本机会把贴桌误报成 5.0(far)，不可靠，仅作回退。
+            Sensor backProx = findSensorByType(sm, BACK_PROX_FACTORY_TYPE);
+            final boolean factoryRaw = backProx != null;
             if (backProx == null) {
-                backProx = sm.getDefaultSensor(BACK_PROXIMITY_SENSOR_TYPE, true);
+                backProx = sm.getDefaultSensor(BACK_PROXIMITY_SENSOR_TYPE, false);
+                if (backProx == null) {
+                    backProx = sm.getDefaultSensor(BACK_PROXIMITY_SENSOR_TYPE, true);
+                }
             }
             if (backProx == null) {
+                XposedBridge.log(TAG + ": registerBackProximity: back proximity sensor not found");
                 return;
             }
             sSensorManager = sm;
+            sLastBackProxNear = null;
             sBackProxListener = new SensorEventListener() {
                 @Override
                 public void onSensorChanged(SensorEvent event) {
                     if (event == null || event.values == null || event.values.length == 0) {
                         return;
                     }
-                    boolean near = event.values[0] < 1.0f;
-                    if (near) {
-                        sMainHandler.removeCallbacks(sTableOffRunnable);
-                        sMainHandler.postDelayed(sTableOffRunnable, 1500L);
-                    } else {
-                        sMainHandler.removeCallbacks(sTableOffRunnable);
+                    // 原始流：v0 越大越近（>=900 贴桌）；包装值：越小越近（<1.0 贴脸）
+                    boolean near = factoryRaw
+                            ? event.values[0] >= BACK_PROX_FACTORY_NEAR
+                            : event.values[0] < 1.0f;
+                    // 原始流是 200ms 连续上报：必须只在 near 翻转时调度，否则定时器会被不断推迟永不触发
+                    if (sLastBackProxNear == null || sLastBackProxNear != near) {
+                        sLastBackProxNear = near;
+                        XposedBridge.log(TAG + ": backProx" + (factoryRaw ? "[raw]" : "[std]")
+                                + " v0=" + event.values[0] + " near=" + near
+                                + (near ? " -> schedule table-off in 1.5s" : " -> cancel table-off"));
+                        if (near) {
+                            sMainHandler.removeCallbacks(sTableOffRunnable);
+                            sMainHandler.postDelayed(sTableOffRunnable, 1500L);
+                        } else {
+                            sMainHandler.removeCallbacks(sTableOffRunnable);
+                        }
                     }
                 }
 
@@ -865,6 +929,7 @@ public final class SubscreenCenterHook {
                 }
             };
             sm.registerListener(sBackProxListener, backProx, SensorManager.SENSOR_DELAY_NORMAL);
+            XposedBridge.log(TAG + ": registerBackProximity OK -> " + (factoryRaw ? "RAW " : "STD ") + backProx.getName());
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": registerBackProximity failed: " + t);
         }
@@ -878,6 +943,23 @@ public final class SubscreenCenterHook {
         } catch (Throwable ignored) {
         }
         sBackProxListener = null;
+    }
+
+    /** factory 隐藏传感器 getDefaultSensor 取不到，需遍历 TYPE_ALL 按 type 精确匹配 */
+    private static Sensor findSensorByType(SensorManager sm, int type) {
+        try {
+            java.util.List<Sensor> all = sm.getSensorList(Sensor.TYPE_ALL);
+            if (all != null) {
+                for (Sensor s : all) {
+                    if (s.getType() == type && !s.isWakeUpSensor()) {
+                        return s;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": findSensorByType(" + type + ") failed: " + t);
+        }
+        return null;
     }
 
     private static void registerGravityAutoRotate(Activity act) {

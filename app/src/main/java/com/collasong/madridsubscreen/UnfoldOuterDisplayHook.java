@@ -34,6 +34,8 @@ public final class UnfoldOuterDisplayHook {
     public static final String ACTION_EXIT_REAR_SCREEN = "com.collasong.madridsubscreen.ACTION_EXIT_REAR_SCREEN";
     public static final String ACTION_ENTER_REAR_SCREEN = "com.collasong.madridsubscreen.ACTION_ENTER_REAR_SCREEN";
     public static final String ACTION_FINISH_REAR_LAUNCHER = "com.collasong.madridsubscreen.ACTION_FINISH_REAR_LAUNCHER";
+    /** 弯折支架模式开关变化后请求强制刷新内屏电源状态 */
+    public static final String ACTION_APPLY_STAND_MODE = "com.collasong.madridsubscreen.ACTION_APPLY_STAND_MODE";
     public static final String EXTRA_SILENT_FINISH = "silent_finish";
     public static final String ACTION_FOLDED_REAR_OVERLAY = "com.collasong.madridsubscreen.ACTION_FOLDED_REAR_OVERLAY";
     public static final String EXTRA_HIDE_OVERLAY = "hide_overlay";
@@ -55,6 +57,8 @@ public final class UnfoldOuterDisplayHook {
     public static final String KEY_REAR_TOUCH_LOCK = "madrid_rear_touch_lock";
     /** 视频壁纸循环播放：动态壁纸播完立即从头重播，不再停帧（0/1，默认 0） */
     public static final String KEY_REAR_VIDEO_LOOP = "madrid_rear_video_loop";
+    /** 弯折支架模式：半展开(baseId=2)时关内屏、只亮背屏当支架展示壁纸（0/1，默认 0） */
+    public static final String KEY_HALF_OPEN_INNER_OFF = "madrid_half_open_inner_off";
     public static final String EXTRA_FOLDED_MODE = "madrid_folded_mode";
 
     private static final float FLIP2_MIN_BRIGHTNESS = 0.000854597f;
@@ -76,6 +80,15 @@ public final class UnfoldOuterDisplayHook {
     private static volatile boolean sRearTouchLockCached = false;
     /** 焦点拦截命中日志的限频时间戳 */
     private static volatile long sRearFocusGuardLogAt = 0L;
+    /** 弯折支架模式是否处于激活状态（半展开 + 开关开 + 背屏已拉起） */
+    private static volatile boolean sHalfStandActive = false;
+    /** DisplayManagerService 实例引用，用于主动刷新电源状态 */
+    private static volatile Object sDisplayManagerService = null;
+    /** 弯折支架开关的短缓存 */
+    private static volatile long sHalfStandCheckedAt = 0L;
+    private static volatile boolean sHalfStandEnabledCached = false;
+    /** 支架模式命中日志限频 */
+    private static volatile long sHalfStandLogAt = 0L;
     private static final Handler sMainHandler = new Handler(Looper.getMainLooper());
 
     private UnfoldOuterDisplayHook() {
@@ -92,6 +105,7 @@ public final class UnfoldOuterDisplayHook {
         hookBackTapShortcut(cl);
         hookHideFoldedWidgets(cl);
         hookRearTouchFocusGuard(cl);
+        hookHalfOpenStandMode(cl);
     }
 
     /**
@@ -178,6 +192,204 @@ public final class UnfoldOuterDisplayHook {
         }
         sRearTouchLockCheckedAt = now;
         return sRearTouchLockCached;
+    }
+
+    /**
+     * 弯折支架模式：半展开(baseId=2)且开关开启时，关掉内屏(display 0)、只保留背屏(display 1)亮着，
+     * 机身即可当支架展示背屏壁纸。合盖/展开/关开关后立即恢复内屏。
+     * <p>
+     * 做法：hook DisplayPowerController.requestPowerState(DisplayPowerRequest, boolean)。
+     * 每个 DPC 实例有 mDisplayId 字段；当它是内屏(0)且支架模式生效时，把 DisplayPowerRequest.policy
+     * 改为 OFF(0)——真正熄灭内屏物理面板。注意不能用 DOZE(1)：本机 AOD(doze_always_on=1) 开启，
+     * DOZE 下熄屏显示会继续画时钟/壁纸，用户看到内屏"仍然点亮"。OFF 只 blank 这一块屏，
+     * 不动全局 wakefulness、不触发锁屏，背屏 DPC(1) 完全不干预。
+     * <p>
+     * 生效条件三重：baseId==2（半展开）、开关=1、背屏模式已拉起(committed==5)。
+     * 任一不成立则完全放过，下个电源请求自然恢复 BRIGHT，无需手动复位。
+     */
+    private static void hookHalfOpenStandMode(ClassLoader cl) {
+        try {
+            // 捕获 DisplayManagerService 实例，供开关变化时主动刷新电源状态
+            try {
+                Class<?> dmsCls = XposedHelpers.findClass("com.android.server.display.DisplayManagerService", cl);
+                XposedBridge.hookAllMethods(dmsCls, "onBootPhase", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        sDisplayManagerService = param.thisObject;
+                    }
+                });
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": capture DMS instance failed: " + t);
+            }
+
+            Class<?> dpcCls = XposedHelpers.findClass("com.android.server.display.DisplayPowerController", cl);
+            XposedBridge.hookAllMethods(dpcCls, "requestPowerState", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        int displayId = XposedHelpers.getIntField(param.thisObject, "mDisplayId");
+                        if (displayId != 0) {
+                            return;
+                        }
+                        if (!isStandModeActive()) {
+                            return;
+                        }
+                        if (param.args == null || param.args.length < 1 || param.args[0] == null) {
+                            return;
+                        }
+                        Object req = param.args[0];
+                        int policy;
+                        try {
+                            policy = XposedHelpers.getIntField(req, "policy");
+                        } catch (Throwable ignored) {
+                            return;
+                        }
+                        // 已是 OFF 则不动，避免重复干预；DOZE(1) 也要强改成 OFF，否则 AOD 继续亮
+                        if (policy == 0) {
+                            return;
+                        }
+                        // 复制请求再改，避免污染其它 DPC 共享的同一个 request 对象
+                        Object copy;
+                        try {
+                            copy = req.getClass().newInstance();
+                            XposedHelpers.callMethod(copy, "copyFrom", req);
+                        } catch (Throwable t) {
+                            copy = req;
+                        }
+                        XposedHelpers.setIntField(copy, "policy", 0); // POLICY_OFF 真正黑屏
+                        param.args[0] = copy;
+                        long now = System.currentTimeMillis();
+                        if (now - sHalfStandLogAt > 10000L) {
+                            sHalfStandLogAt = now;
+                            XposedBridge.log(TAG + ": half-open stand mode -> inner display 0 policy "
+                                    + policy + "->OFF (AOD-safe)");
+                        }
+                    } catch (Throwable t) {
+                        // 任何异常都放过，绝不破坏显示电源系统
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": hooked DisplayPowerController.requestPowerState for half-open stand mode");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": hook half-open stand mode failed: " + t);
+        }
+    }
+
+    /** 当前是否处于弯折支架模式：半展开 + 背屏已开 + 开关开。带短缓存，供电源高频路径使用。 */
+    private static boolean isStandModeActive() {
+        long now = System.currentTimeMillis();
+        if (now - sHalfStandCheckedAt <= 250L) {
+            return sHalfStandActive;
+        }
+        Context ctx = sSystemContext;
+        if (ctx == null) {
+            return false;
+        }
+        boolean enabled;
+        try {
+            enabled = Settings.Global.getInt(ctx.getContentResolver(),
+                    KEY_HALF_OPEN_INNER_OFF, 0) == 1;
+        } catch (Throwable ignored) {
+            enabled = false;
+        }
+        // 实时读取设备状态，避免完全依赖 hook 回调更新（模块加载时设备可能已处于弯折态）
+        int baseId = sCurrentBaseState;
+        boolean committed5 = sHalfStandCommitted;
+        try {
+            Object svc = sDeviceStateService;
+            if (svc != null) {
+                Optional<?> baseOpt = (Optional<?>) XposedHelpers.callMethod(svc, "getBaseState");
+                Optional<?> comOpt = (Optional<?>) XposedHelpers.callMethod(svc, "getCommittedState");
+                if (baseOpt != null && baseOpt.isPresent()) {
+                    baseId = (int) XposedHelpers.callMethod(baseOpt.get(), "getIdentifier");
+                }
+                if (comOpt != null && comOpt.isPresent()) {
+                    committed5 = ((int) XposedHelpers.callMethod(comOpt.get(), "getIdentifier")) == 5;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        sHalfStandCheckedAt = now;
+        sHalfStandEnabledCached = enabled;
+        boolean active = enabled && baseId == 2 && committed5 && !isFolded(baseId);
+        if (active != sHalfStandActive) {
+            sHalfStandActive = active;
+            XposedBridge.log(TAG + ": half-open stand mode -> " + (active ? "ACTIVE (inner off)" : "INACTIVE (inner restored)"));
+        }
+        return active;
+    }
+
+    private static boolean isFolded(int baseId) {
+        return baseId == 0 || baseId == 1;
+    }
+
+    /** 背屏 state=5 是否已提交（支架模式生效前提之一），由 device state hook 更新。 */
+    private static volatile boolean sHalfStandCommitted = false;
+
+    /**
+     * 开关变化瞬间设备可能已处于弯折态、内屏稳定亮着且不会有新的电源请求。
+     * 关键：绝不能只调 sendUpdatePowerState()——它只在 DPC 内部重跑状态机，
+     * 不会经过 requestPowerState hook，policy 永远是系统原来的 BRIGHT，hook 根本没机会改。
+     * 这里主动构造一个电源请求重新走 requestPowerState（会经过我们的 hook），
+     * 让内屏立刻进入 OFF / 恢复 BRIGHT。
+     */
+    private static void forceRefreshAllDisplayPower(ClassLoader cl) {
+        try {
+            Object dms = sDisplayManagerService;
+            if (dms == null) {
+                XposedBridge.log(TAG + ": forceRefresh DMS instance not captured yet");
+                return;
+            }
+            Object dpcsObj = XposedHelpers.getObjectField(dms, "mDisplayPowerControllers");
+            if (!(dpcsObj instanceof android.util.SparseArray)) {
+                XposedBridge.log(TAG + ": forceRefresh mDisplayPowerControllers not SparseArray: " + dpcsObj);
+                return;
+            }
+            // 先清缓存，确保这里读到的是开关的最新值
+            sHalfStandCheckedAt = 0L;
+            boolean stand = isStandModeActive();
+            android.util.SparseArray<?> dpcs = (android.util.SparseArray<?>) dpcsObj;
+            int refreshed = 0;
+            for (int i = 0; i < dpcs.size(); i++) {
+                Object dpc = dpcs.valueAt(i);
+                if (dpc == null) {
+                    continue;
+                }
+                try {
+                    int displayId = XposedHelpers.getIntField(dpc, "mDisplayId");
+                    if (displayId != 0) {
+                        // 背屏不干预，只让它重跑一次内部状态机即可
+                        XposedHelpers.callMethod(dpc, "sendUpdatePowerState");
+                        refreshed++;
+                        continue;
+                    }
+                    // 内屏：拿当前请求复制一份，显式设置目标 policy 后重新提交
+                    Object curReq = XposedHelpers.getObjectField(dpc, "mPowerRequest");
+                    if (curReq == null) {
+                        XposedHelpers.callMethod(dpc, "sendUpdatePowerState");
+                        refreshed++;
+                        continue;
+                    }
+                    Object newReq = curReq;
+                    try {
+                        newReq = curReq.getClass().newInstance();
+                        XposedHelpers.callMethod(newReq, "copyFrom", curReq);
+                    } catch (Throwable ignored) {
+                        // 复制失败就直接用原对象，仍可推进状态
+                    }
+                    // stand=true → 0=OFF 真黑屏；false → 3=BRIGHT 恢复原样
+                    XposedHelpers.setIntField(newReq, "policy", stand ? 0 : 3);
+                    XposedHelpers.callMethod(dpc, "requestPowerState", newReq, false);
+                    refreshed++;
+                } catch (Throwable t) {
+                    XposedBridge.log(TAG + ": forceRefresh dpc#" + i + " failed: " + t);
+                }
+            }
+            XposedBridge.log(TAG + ": force-refreshed " + refreshed
+                    + " display power controllers, inner policy -> " + (stand ? "OFF" : "BRIGHT"));
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": forceRefreshAllDisplayPower failed: " + t);
+        }
     }
 
     private static void hookHideFoldedWidgets(ClassLoader cl) {
@@ -730,6 +942,7 @@ public final class UnfoldOuterDisplayHook {
                             IntentFilter filter = new IntentFilter();
                             filter.addAction(ACTION_EXIT_REAR_SCREEN);
                             filter.addAction(ACTION_ENTER_REAR_SCREEN);
+                            filter.addAction(ACTION_APPLY_STAND_MODE);
                             BroadcastReceiver receiver = new BroadcastReceiver() {
                                 @Override
                                 public void onReceive(Context context, Intent intent) {
@@ -742,6 +955,12 @@ public final class UnfoldOuterDisplayHook {
                                         }
                                     } else if (ACTION_ENTER_REAR_SCREEN.equals(act)) {
                                         enterRearState("broadcast");
+                                    } else if (ACTION_APPLY_STAND_MODE.equals(act)) {
+                                        // 开关变化：清缓存并强制所有 DPC 重新评估电源状态
+                                        sHalfStandCheckedAt = 0L;
+                                        XposedBridge.log(TAG + ": APPLY_STAND_MODE broadcast received, refreshing display power");
+                                        final ClassLoader dcl = sSystemClassLoader;
+                                        sMainHandler.postDelayed(() -> forceRefreshAllDisplayPower(dcl), 150L);
                                     }
                                 }
                             };
@@ -775,6 +994,11 @@ public final class UnfoldOuterDisplayHook {
                         sCurrentBaseState = baseId;
                         int committedId = (committedOpt != null && committedOpt.isPresent())
                                 ? (int) XposedHelpers.callMethod(committedOpt.get(), "getIdentifier") : -1;
+                        // 背屏 state=5 是否已提交，供弯折支架模式判断
+                        sHalfStandCommitted = (committedId == 5);
+                        if (committedId != 5) {
+                            sHalfStandActive = false;
+                        }
 
                         // 1. 合盖（0/1）时：立即取消任何排队中的延迟开启任务（根治合盖经过半展开误触发 state=5 导致外屏黑屏卡死！）
                         if (baseId == 0 || baseId == 1) {
@@ -795,9 +1019,13 @@ public final class UnfoldOuterDisplayHook {
                         // 2. 半展开桌钟模式（baseId == 2 HALF_OPENED）：自动激活背屏（延迟 600ms 防合盖路过误触）
                         if (baseId == 2 && committedId != 5) {
                             Context ctx = sSystemContext;
-                            if (ctx != null && Settings.Global.getInt(ctx.getContentResolver(), KEY_HALF_OPEN_REAR, 0) == 1) {
-                                scheduleEnterRearState("half_open_desk_clock", 600L);
-                                return;
+                            if (ctx != null) {
+                                boolean deskClock = Settings.Global.getInt(ctx.getContentResolver(), KEY_HALF_OPEN_REAR, 0) == 1;
+                                boolean standMode = Settings.Global.getInt(ctx.getContentResolver(), KEY_HALF_OPEN_INNER_OFF, 0) == 1;
+                                if (deskClock || standMode) {
+                                    scheduleEnterRearState(standMode ? "half_open_stand" : "half_open_desk_clock", 600L);
+                                    return;
+                                }
                             }
                         }
 
@@ -845,12 +1073,12 @@ public final class UnfoldOuterDisplayHook {
         if (ctx == null || cl == null) {
             return;
         }
+        ensureSubscreenHookReady(ctx);
         // 二次防呆：合盖状态下绝不允许拉起 state=5，根治合盖外屏黑屏卡死！
         if (sCurrentBaseState == 0 || sCurrentBaseState == 1) {
             XposedBridge.log(TAG + ": aborted enterRearState(" + reason + ") because device is folded (baseId=" + sCurrentBaseState + ")");
             return;
         }
-        ensureSubscreenHookReady(ctx);
         try {
             Class<?> dsmCls = XposedHelpers.findClass("android.hardware.devicestate.DeviceStateManager", cl);
             Object dsm = ctx.getSystemService(dsmCls);

@@ -41,16 +41,25 @@ public class SettingsActivity extends Activity {
     private static final int[] FOLDED_EXIT_VALUES = {1, 2, 0};
     private static final String[] FOLDED_EXIT_LABELS = {"直接息屏", "回原厂锁屏", "回外屏桌面"};
 
+    private static final int[] FLIP_ALIGN_VALUES = {0, 1, 2};
+    private static final String[] FLIP_ALIGN_LABELS = {"贴左避让", "居中满幅", "关闭翻转"};
+
+    private static final int[] VIDEO_MODE_VALUES = {0, 1, 2, 3};
+    private static final String[] VIDEO_MODE_LABELS = {"循环", "点击重播", "亮屏一次", "仅播一次"};
+
     private boolean dark;
     private int cBg, cCard, cStroke, cText, cSub, cDivider, cAccent, cAccentSoft;
-    private int cOk, cOkSoft, cDanger, cDangerSoft, cTrack;
+    private int cOk, cOkSoft, cWarn, cWarnSoft, cDanger, cDangerSoft, cTrack;
 
+    private LinearLayout statusBanner;
     private TextView statusBadge, statusDetail;
     private TextView[] capSegments = new TextView[CAP_VALUES.length];
     private TextView[] scaleSegments = new TextView[SCALE_VALUES.length];
     private TextView[] timeoutSegments = new TextView[TIMEOUT_VALUES.length];
     private TextView[] burninSegments = new TextView[BURNIN_VALUES.length];
     private TextView[] foldedExitSegments = new TextView[FOLDED_EXIT_VALUES.length];
+    private TextView[] flipAlignSegments = new TextView[FLIP_ALIGN_VALUES.length];
+    private TextView[] videoModeSegments = new TextView[VIDEO_MODE_VALUES.length];
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -77,27 +86,27 @@ public class SettingsActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("v1.0.6 · 小米 18 背屏中心 (OS4.0.31.0) · MIX Flip 2 专用");
+        subtitle.setText("v2.0.0 · 小米 18 背屏中心 (OS4.0.31.0) · MIX Flip 2 专用");
         subtitle.setTextSize(13);
         subtitle.setTextColor(cSub);
         subtitle.setPadding(0, dp(4), 0, dp(14));
         root.addView(subtitle);
 
-        // 2. 顶部状态横幅
-        LinearLayout banner = roundedCard(root, cOkSoft, cOk, 18, 14);
+        // 2. 顶部状态横幅（未开启背屏显示黄色「模块就绪，等待开启背屏」，已开启背屏显示绿色）
+        statusBanner = roundedCard(root, cWarnSoft, cWarn, 18, 14);
         statusBadge = new TextView(this);
-        statusBadge.setText("●  小米 18 背屏引擎就绪");
+        statusBadge.setText("●  模块就绪，等待开启背屏");
         statusBadge.setTextSize(15);
         statusBadge.setTypeface(Typeface.DEFAULT_BOLD);
-        statusBadge.setTextColor(cOk);
-        banner.addView(statusBadge);
+        statusBadge.setTextColor(cWarn);
+        statusBanner.addView(statusBadge);
 
         statusDetail = new TextView(this);
         statusDetail.setText("双摄对齐 1208×738 · 背面光感自动亮度 · 背面接近传感器防误亮");
         statusDetail.setTextSize(12);
         statusDetail.setTextColor(cSub);
         statusDetail.setPadding(0, dp(4), 0, 0);
-        banner.addView(statusDetail);
+        statusBanner.addView(statusDetail);
 
         // 3. 快捷操作卡片
         addSectionTitle(root, "快捷控制");
@@ -112,6 +121,7 @@ public class SettingsActivity extends Activity {
             }
             runRootCmd("cmd device_state state 5 && sleep 0.4 && am start --display 1 -n com.xiaomi.subscreencenter/.SubScreenLauncher");
             toast("已开启展开态背屏（双击下方区域或合盖可退出）");
+            statusBanner.postDelayed(this::refreshBannerStatus, 900L);
         });
         addPillButton(row1, "关闭背屏", cDangerSoft, cDanger, dp(8), 0, () -> {
             try {
@@ -120,25 +130,9 @@ public class SettingsActivity extends Activity {
             }
             runRootCmd("cmd device_state state reset");
             toast("已关闭背屏并恢复默认外屏");
+            statusBanner.postDelayed(this::refreshBannerStatus, 700L);
         });
         quickCard.addView(row1);
-
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams row2Lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        row2Lp.topMargin = dp(10);
-        row2.setLayoutParams(row2Lp);
-        addPillButton(row2, "管理官方应用卡", cAccentSoft, cAccent, 0, 0, () -> {
-            try {
-                Intent it = new Intent("miui.intent.action.REAR_APP_MINE");
-                it.setPackage("com.xiaomi.subscreencenter");
-                startActivity(it);
-            } catch (Throwable t) {
-                toast("打开应用卡管理失败: " + t.getMessage());
-            }
-        });
-        quickCard.addView(row2);
 
         // 3.5 按键与手势触发卡片
         addSectionTitle(root, "按键与手势触发");
@@ -190,17 +184,6 @@ public class SettingsActivity extends Activity {
             updateSegmentSelection(foldedExitSegments, idx);
             toast("合盖背屏退出后：" + FOLDED_EXIT_LABELS[idx]);
         });
-
-        addDivider(gestureCard);
-
-        addSwitchRow(gestureCard,
-                "背屏左滑直接打开外屏自拍",
-                "在背屏右侧边缘或下方毛玻璃/空白区向左滑动，直接拉起 Flip 2 原厂外屏自拍相机",
-                getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_SWIPE_CAMERA, 1) == 1,
-                (b, checked) -> {
-                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_SWIPE_CAMERA + " " + (checked ? "1" : "0"));
-                    toast(checked ? "已开启左滑打开外屏自拍" : "已关闭左滑打开外屏自拍");
-                });
 
         // 4. 亮度与显示卡片
         addSectionTitle(root, "亮度与视觉");
@@ -256,11 +239,54 @@ public class SettingsActivity extends Activity {
 
         addSwitchRow(displayCard,
                 "背屏随重力自动倒置旋转（0° / 180°）",
-                "倒握或倒立放置手机时自动平滑旋转背屏 180° 并同步转换触控坐标",
-                getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_AUTO_ROTATE, 1) == 1,
+                "倒握或倒立放置手机时自动平滑旋转背屏 180°（默认关闭，避免半折立放时角度抖动误翻转）",
+                getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_AUTO_ROTATE, 0) == 1,
                 (b, checked) -> {
                     runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_AUTO_ROTATE + " " + (checked ? "1" : "0"));
                     toast(checked ? "已开启背屏重力倒置旋转" : "已关闭背屏重力倒置旋转");
+                });
+
+        addDivider(displayCard);
+
+        TextView faTitle = new TextView(this);
+        faTitle.setText("翻转 / 弯折时双摄避让方式");
+        faTitle.setTextSize(14);
+        faTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        faTitle.setTextColor(cText);
+        displayCard.addView(faTitle);
+
+        TextView faSub = new TextView(this);
+        faSub.setText("贴左避让=把左侧空隙挤到右侧留给双摄；居中满幅=180°居中不偏移；关闭翻转=保持0°正向");
+        faSub.setTextSize(12);
+        faSub.setTextColor(cSub);
+        faSub.setPadding(0, dp(2), 0, dp(10));
+        displayCard.addView(faSub);
+
+        int curFlipAlign = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_FLIP_ALIGN, 0);
+        addSegmentBar(displayCard, FLIP_ALIGN_LABELS, flipAlignSegments, indexOf(FLIP_ALIGN_VALUES, curFlipAlign, 0), idx -> {
+            int val = FLIP_ALIGN_VALUES[idx];
+            runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_FLIP_ALIGN + " " + val);
+            updateSegmentSelection(flipAlignSegments, idx);
+            toast("翻转/弯折避让方式：" + FLIP_ALIGN_LABELS[idx]);
+        });
+
+        addDivider(displayCard);
+
+        addSwitchRow(displayCard,
+                "背屏全屏模式（原厂视口）",
+                "跳过 1208×738 裁切与毛玻璃，满铺展示自定义照片/视频壁纸；使用萌宠或应用卡时请关闭以保持 1:1 正确缩放",
+                getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_STOCK_FULLSCREEN, 0) == 1,
+                (b, checked) -> {
+                    int v = checked ? 1 : 0;
+                    Intent it = new Intent(UnfoldOuterDisplayHook.ACTION_RELOAD_REAR_SCREEN);
+                    it.putExtra(UnfoldOuterDisplayHook.EXTRA_SETTING_KEY, UnfoldOuterDisplayHook.KEY_REAR_STOCK_FULLSCREEN);
+                    it.putExtra(UnfoldOuterDisplayHook.EXTRA_SETTING_VAL, v);
+                    try {
+                        sendBroadcast(it);
+                    } catch (Throwable ignored) {
+                    }
+                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_STOCK_FULLSCREEN + " " + v);
+                    toast(checked ? "已切换背屏全屏模式，正在重载外屏" : "已切回 1208×738 双摄对齐模式，正在重载外屏");
                 });
 
         addDivider(displayCard);
@@ -270,9 +296,16 @@ public class SettingsActivity extends Activity {
                 "保持上方 1208×738 应用卡完整不变形，实时采样背屏颜色做毛玻璃填补（防分界线烧屏）",
                 getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_FULLSCREEN, 0) == 1,
                 (b, checked) -> {
-                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_FULLSCREEN + " " + (checked ? "1" : "0")
-                            + " && am force-stop com.xiaomi.subscreencenter");
-                    toast(checked ? "已开启实时取色毛玻璃扩展" : "已切回纯黑 OLED 底部");
+                    int v = checked ? 1 : 0;
+                    Intent it = new Intent(UnfoldOuterDisplayHook.ACTION_RELOAD_REAR_SCREEN);
+                    it.putExtra(UnfoldOuterDisplayHook.EXTRA_SETTING_KEY, UnfoldOuterDisplayHook.KEY_REAR_FULLSCREEN);
+                    it.putExtra(UnfoldOuterDisplayHook.EXTRA_SETTING_VAL, v);
+                    try {
+                        sendBroadcast(it);
+                    } catch (Throwable ignored) {
+                    }
+                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_FULLSCREEN + " " + v);
+                    toast(checked ? "已开启实时取色毛玻璃扩展，正在重载外屏" : "已切回纯黑 OLED 底部，正在重载外屏");
                 });
 
         addDivider(displayCard);
@@ -305,7 +338,7 @@ public class SettingsActivity extends Activity {
 
         addSwitchRow(lockCard,
                 "背屏触摸锁定（防误触）",
-                "展开使用时外屏不再响应任何触摸（含双击退出、左滑自拍）；内屏触控、背屏画面与壁纸均不受影响，关闭后立即恢复。",
+                "展开使用时外屏不再响应任何触摸（含双击退出）；内屏触控、背屏画面与壁纸均不受影响，关闭后立即恢复。",
                 getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_TOUCH_LOCK, 0) == 1,
                 (b, checked) -> {
                     runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_TOUCH_LOCK + " " + (checked ? "1" : "0"));
@@ -314,17 +347,51 @@ public class SettingsActivity extends Activity {
 
         addDivider(lockCard);
 
+        TextView vmTitle = new TextView(this);
+        vmTitle.setText("相册轮播与签名视频 / Live 图播放模式");
+        vmTitle.setTextSize(14);
+        vmTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        vmTitle.setTextColor(cText);
+        lockCard.addView(vmTitle);
+
+        TextView vmSub = new TextView(this);
+        vmSub.setText("循环=无限循环播放；点击重播=停在尾帧，轻点再播；亮屏一次=每次亮屏播放一次；仅播一次=只播一次停在尾帧");
+        vmSub.setTextSize(12);
+        vmSub.setTextColor(cSub);
+        vmSub.setPadding(0, dp(2), 0, dp(10));
+        lockCard.addView(vmSub);
+
+        int curVideoMode = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_VIDEO_PLAY_MODE, -1);
+        if (curVideoMode < 0) {
+            curVideoMode = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP, 0) == 1 ? 0 : 1;
+        }
+        addSegmentBar(lockCard, VIDEO_MODE_LABELS, videoModeSegments, indexOf(VIDEO_MODE_VALUES, curVideoMode, 1), idx -> {
+            int val = VIDEO_MODE_VALUES[idx];
+            runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_VIDEO_PLAY_MODE + " " + val);
+            runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP + " " + (val == 0 ? "1" : "0"));
+            updateSegmentSelection(videoModeSegments, idx);
+            toast("相册轮播/签名播放模式：" + VIDEO_MODE_LABELS[idx]);
+        });
+
+        addDivider(lockCard);
+
         addSwitchRow(lockCard,
-                "视频壁纸循环播放",
-                "背屏动态壁纸播放到结尾时立即从头重播，不再停在最后一帧；关闭后恢复系统默认的播完暂停。",
-                getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP, 0) == 1,
+                "弯折支架模式（关内屏只留背屏）",
+                "半展开当支架时自动拉起背屏并关闭内屏、只亮背屏展示壁纸；展开、合盖或关闭本开关后立即恢复内屏。",
+                getGlobalInt(UnfoldOuterDisplayHook.KEY_HALF_OPEN_INNER_OFF, 0) == 1,
                 (b, checked) -> {
-                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP + " " + (checked ? "1" : "0"));
-                    toast(checked ? "已开启视频壁纸循环播放" : "已关闭循环，恢复播完暂停");
+                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_HALF_OPEN_INNER_OFF + " " + (checked ? "1" : "0"),
+                            () -> {
+                                try {
+                                    sendBroadcast(new Intent(UnfoldOuterDisplayHook.ACTION_APPLY_STAND_MODE));
+                                } catch (Throwable ignored) {
+                                }
+                            });
+                    toast(checked ? "已开启弯折支架模式，半展开将关闭内屏" : "已关闭弯折支架模式，内屏恢复");
                 });
 
         // 5. 息屏与自动化卡片
-        addSectionTitle(root, "息屏与自动化（方案 A）");
+        addSectionTitle(root, "息屏与自动化");
         LinearLayout autoCard = roundedCard(root, cCard, cStroke, 18, 16);
 
         TextView toTitle = new TextView(this);
@@ -377,13 +444,13 @@ public class SettingsActivity extends Activity {
 
         addSwitchRow(autoCard,
                 "平放桌面自动关闭外屏",
-                "背面接近传感器（33171123）检测到背面朝下遮挡 1.5 秒后自动熄灭外屏",
+                "背面接近传感器（33171124 原始流 / 33171123 兜底）检测到背面朝下遮挡 1.5 秒后自动熄灭外屏",
                 getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_TABLE_OFF, 1) == 1,
                 (b, checked) -> runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_TABLE_OFF + " " + (checked ? "1" : "0")));
 
         // 底部提示
         TextView foot = new TextView(this);
-        foot.setText("提示：也可在控制中心编辑添加「小米18背屏」磁贴一键开关；每 15 秒内置 0~180px 积极防烧屏上下微移。");
+        foot.setText("提示：也可在控制中心编辑添加「小米18背屏」磁贴一键开关；支持三档防烧屏位移、弯折支架模式与官方背屏个性化（半屏/全屏相册轮播与签名、视频/Live图）。");
         foot.setTextSize(12);
         foot.setTextColor(cSub);
         foot.setPadding(dp(4), dp(14), dp(4), 0);
@@ -391,6 +458,92 @@ public class SettingsActivity extends Activity {
         root.addView(foot);
 
         setContentView(scroll);
+        refreshBannerStatus();
+        checkEnvironmentAndGuide();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshBannerStatus();
+    }
+
+    private void refreshBannerStatus() {
+        if (statusBanner == null || statusBadge == null) {
+            return;
+        }
+        boolean rearOn = false;
+        try {
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager) getSystemService(DISPLAY_SERVICE);
+            if (dm != null) {
+                android.view.Display d1 = dm.getDisplay(1);
+                if (d1 != null && d1.getState() == android.view.Display.STATE_ON) {
+                    rearOn = true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        int fill = rearOn ? cOkSoft : cWarnSoft;
+        int accent = rearOn ? cOk : cWarn;
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(fill);
+        bg.setCornerRadius(dp(18));
+        bg.setStroke(dp(1), accent);
+        statusBanner.setBackground(bg);
+        statusBadge.setTextColor(accent);
+        statusBadge.setText(rearOn ? "●  小米 18 背屏已开启" : "●  模块就绪，等待开启背屏");
+    }
+
+    /** 检测是否缺少配套 KSU 资源模块（com.xiaomi.subscreencenter）或缺少 Root 权限，弹窗引导安装与授权。 */
+    private void checkEnvironmentAndGuide() {
+        new Thread(() -> {
+            boolean hasSubscreenPkg = false;
+            try {
+                getPackageManager().getPackageInfo("com.xiaomi.subscreencenter", 0);
+                hasSubscreenPkg = true;
+            } catch (Throwable ignored) {
+            }
+            boolean hasRoot = false;
+            try {
+                Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", "id"});
+                hasRoot = (p.waitFor() == 0);
+            } catch (Throwable ignored) {
+            }
+            if (!hasSubscreenPkg || !hasRoot) {
+                final boolean missingKsu = !hasSubscreenPkg;
+                final boolean missingRoot = !hasRoot;
+                runOnUiThread(() -> showSetupGuideDialog(missingKsu, missingRoot));
+            }
+        }).start();
+    }
+
+    private void showSetupGuideDialog(boolean missingKsu, boolean missingRoot) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("检测到当前环境尚未配置完整：\n\n");
+        if (missingKsu) {
+            sb.append("1. 未检测到小米 18 背屏中心（com.xiaomi.subscreencenter）\n")
+              .append("   仅安装 LSPosed 模块无法点亮小米 18 背屏，请先在 KernelSU / Magisk 中刷入配套资源模块 madrid_subscreen_port_v1.0.0.zip 并重启手机。\n\n");
+        }
+        if (missingRoot) {
+            sb.append(missingKsu ? "2. " : "1. ")
+              .append("未授予本应用 Root 权限\n")
+              .append("   请在 KernelSU 超级用户列表中为「Madrid(小米18)背屏移植flip2」开启 Root 授权，以确保快捷键绑定、全屏/半屏切换与背屏启停正常工作。");
+        }
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+                .setTitle("环境安装与权限引导")
+                .setMessage(sb.toString().trim())
+                .setPositiveButton("我知道了", null);
+        if (missingRoot) {
+            b.setNeutralButton("申请 Root 权限", (d, w) -> runRootCmd("id", () -> toast("Root 权限已就绪")));
+        }
+        try {
+            b.show();
+        } catch (Throwable ignored) {
+        }
     }
 
     private void initTheme() {
@@ -407,6 +560,8 @@ public class SettingsActivity extends Activity {
         cAccentSoft = Color.parseColor(dark ? "#172554" : "#EFF6FF");
         cOk = Color.parseColor(dark ? "#34D399" : "#059669");
         cOkSoft = Color.parseColor(dark ? "#064E3B" : "#ECFDF5");
+        cWarn = Color.parseColor(dark ? "#FBBF24" : "#D97706");
+        cWarnSoft = Color.parseColor(dark ? "#422006" : "#FFFBEB");
         cDanger = Color.parseColor(dark ? "#F87171" : "#DC2626");
         cDangerSoft = Color.parseColor(dark ? "#450A0A" : "#FEF2F2");
         cTrack = Color.parseColor(dark ? "#1E293B" : "#EEF2F7");
@@ -603,8 +758,12 @@ public class SettingsActivity extends Activity {
     }
 
     private void runRootCmd(final String cmd) {
+        runRootCmd(cmd, null);
+    }
+
+    private void runRootCmd(final String cmd, final Runnable onDone) {
         // 优先用 Settings API 直写：不依赖 root 授权，失败率高且无提示的 su 通道只作为兜底。
-        if (cmd != null) {
+        if (cmd != null && !cmd.contains("&&")) {
             if (cmd.startsWith("settings put global ")) {
                 String rest = cmd.substring("settings put global ".length()).trim();
                 int sp = rest.indexOf(' ');
@@ -613,6 +772,9 @@ public class SettingsActivity extends Activity {
                     String val = rest.substring(sp + 1).trim();
                     try {
                         Settings.Global.putString(getContentResolver(), key, val);
+                        if (onDone != null) {
+                            onDone.run();
+                        }
                         return;
                     } catch (Throwable t) {
                         android.util.Log.w("MadridSettings", "putGlobal " + key + " failed, fallback to su: " + t);
@@ -626,6 +788,9 @@ public class SettingsActivity extends Activity {
                     String val = rest.substring(sp + 1).trim();
                     try {
                         Settings.System.putString(getContentResolver(), key, val);
+                        if (onDone != null) {
+                            onDone.run();
+                        }
                         return;
                     } catch (Throwable t) {
                         android.util.Log.w("MadridSettings", "putSystem " + key + " failed: " + t);
@@ -639,6 +804,8 @@ public class SettingsActivity extends Activity {
                 int code = p.waitFor();
                 if (code != 0) {
                     runOnUiThread(() -> toast("命令执行失败，请确认已在 KernelSU 中授予本应用 root 权限"));
+                } else if (onDone != null) {
+                    runOnUiThread(onDone);
                 }
             } catch (Throwable t) {
                 runOnUiThread(() -> toast("需要 root 权限才能生效，请在 KernelSU 中授权本应用"));

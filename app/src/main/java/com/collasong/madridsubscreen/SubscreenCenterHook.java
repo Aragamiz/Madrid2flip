@@ -55,9 +55,10 @@ public final class SubscreenCenterHook {
 
     private static final String TAG = "MadridSubscreen/Center";
 
-    // MIX Flip 2 外屏宽度 1208px，双摄宽 398px、高 728px；按小米 18 原版 976:596 比例缩放后为 1208×738
+    // MIX Flip 2 外屏物理分辨率 1208×1392，双摄宽 398px、高 728px；按小米 18 原版 976:596 比例缩放后为 1208×738
     private static final int TARGET_WIDTH = 1208;
     private static final int TARGET_HEIGHT = 738;
+    private static final int OUTER_PHYSICAL_HEIGHT = 1392;
     private static final int CAMERA_SAFE_LEFT_PX = 410;
     private static final float VIEWPORT_CORNER_RADIUS_PX = 100f;
     // 防烧屏三档模式（Settings.Global madrid_rear_burnin_mode）：
@@ -66,7 +67,9 @@ public final class SubscreenCenterHook {
     // 2 = 积极大幅档（12s / 顶部0 ↔ 中部320 ↔ 底部640 大幅轮换整屏位置）
     private static final int[] AGGRESSIVE_POSITIONS = {0, 320, 640, 320};
     private static int sAggressiveIdx = 0;
-    private static final int BACK_PROXIMITY_SENSOR_TYPE = 33171123; // TCS3720ALSPRX Proximity Back Sensor
+    private static final int BACK_PROXIMITY_SENSOR_TYPE = 33171123; // TCS3720ALSPRX Proximity Back Sensor（包装值，贴桌易误报 5.0）
+    private static final int BACK_PROX_FACTORY_TYPE = 33171124;     // TCS3720ALSPRX Proximity Back Sensor Strm（原始流，贴桌饱和 ~1023）
+    private static final float BACK_PROX_FACTORY_NEAR = 900f;       // 原始 ADC 阈值：>=900 视为贴桌遮挡
 
     private static long sLastBlackTapTime = 0L;
     private static float sTouchDownX = 0f;
@@ -79,8 +82,10 @@ public final class SubscreenCenterHook {
     private static WeakReference<Activity> sTrackedActivityRef;
     private static SensorManager sSensorManager;
     private static SensorEventListener sBackProxListener;
+    private static volatile Boolean sLastBackProxNear;
     private static android.view.OrientationEventListener sOrientationListener;
     private static int sCurrentContentRotation = 0;
+    private static volatile boolean sIsHalfOpen = false;
     private static volatile boolean sFinishReceiverRegistered;
     private static WeakReference<ImageView> sGlassBgRef;
     private static Bitmap sLastGlassBitmap;
@@ -166,7 +171,12 @@ public final class SubscreenCenterHook {
                     else if (sBurnShiftY <= 0) { sBurnShiftY = 0; sBurnDir = 1; }
                     duration = 700L;
                 }
-                content.animate().translationY(sBurnShiftY).setDuration(duration).start();
+                float targetX = (sCurrentContentRotation == 180 && getFlipAlignMode(content.getContext()) == 0)
+                        ? CAMERA_SAFE_LEFT_PX : 0f;
+                float targetY = (sCurrentContentRotation == 180)
+                        ? (OUTER_PHYSICAL_HEIGHT - TARGET_HEIGHT - Math.min(sBurnShiftY, 48))
+                        : sBurnShiftY;
+                content.animate().translationX(targetX).translationY(targetY).setDuration(duration).start();
                 sMainHandler.postDelayed(this, getBurnInIntervalMs(mode));
             }
         }
@@ -196,11 +206,15 @@ public final class SubscreenCenterHook {
             XposedBridge.log(TAG + ": spoof MiuiMultiDisplayTypeInfo failed: " + t);
         }
 
-        // 始终保持 1208×738（按小米 18 原版 976:596 比例），确保应用卡与双摄避让 100% 永不错位
+        // 始终保持 1208×738（按小米 18 原版 976:596 比例），确保应用卡与双摄避让 100% 永不错位；
+        // 开启「背屏全屏模式（原厂视口）」时跳过视口重映射，完整铺满外屏。
         try {
             XposedHelpers.findAndHookMethod(Display.class, "getRealSize", Point.class, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
+                    if (isStockFullscreen(null)) {
+                        return;
+                    }
                     Display d = (Display) param.thisObject;
                     if (d != null && (d.getDisplayId() == 1 || d.getDisplayId() == 0) && param.args[0] instanceof Point) {
                         Point p = (Point) param.args[0];
@@ -210,9 +224,27 @@ public final class SubscreenCenterHook {
                     }
                 }
             });
-            XposedBridge.log(TAG + ": hooked Display.getRealSize(displayId=1) -> 1208x738");
+            XC_MethodHook metricsHook = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (isStockFullscreen(null)) {
+                        return;
+                    }
+                    Display d = (Display) param.thisObject;
+                    if (d != null && (d.getDisplayId() == 1 || d.getDisplayId() == 0)
+                            && param.args[0] instanceof android.util.DisplayMetrics) {
+                        android.util.DisplayMetrics dm = (android.util.DisplayMetrics) param.args[0];
+                        if (dm.widthPixels == TARGET_WIDTH && dm.heightPixels > TARGET_HEIGHT) {
+                            dm.heightPixels = TARGET_HEIGHT;
+                        }
+                    }
+                }
+            };
+            XposedHelpers.findAndHookMethod(Display.class, "getRealMetrics", android.util.DisplayMetrics.class, metricsHook);
+            XposedHelpers.findAndHookMethod(Display.class, "getMetrics", android.util.DisplayMetrics.class, metricsHook);
+            XposedBridge.log(TAG + ": hooked Display.getRealSize/getRealMetrics/getMetrics(displayId=1) -> 1208x738 (bypassed in stock fullscreen)");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": hook Display.getRealSize failed: " + t);
+            XposedBridge.log(TAG + ": hook Display.getRealSize/Metrics failed: " + t);
         }
 
         // 修复应用卡/面板呼出被 Flip 2 左侧双摄（398px）遮挡：确保 getSafeInsetLeft() 返回 >= 410px
@@ -220,6 +252,9 @@ public final class SubscreenCenterHook {
             XposedHelpers.findAndHookMethod(DisplayCutout.class, "getSafeInsetLeft", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
+                    if (isStockFullscreen(null)) {
+                        return;
+                    }
                     int val = (param.getResult() instanceof Integer) ? (Integer) param.getResult() : 0;
                     if (val < CAMERA_SAFE_LEFT_PX) {
                         param.setResult(CAMERA_SAFE_LEFT_PX);
@@ -237,14 +272,20 @@ public final class SubscreenCenterHook {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     Activity act = (Activity) param.thisObject;
-                    if (!isSubScreenActivity(act.getClass().getName()) || !isFoldedMode(act)) {
+                    if (!isSubScreenActivity(act.getClass().getName())) {
+                        return;
+                    }
+                    boolean stockFs = isStockFullscreen(act);
+                    if (!stockFs && !isFoldedMode(act)) {
                         return;
                     }
                     try {
                         android.view.Window win = act.getWindow();
                         if (win != null) {
-                            win.setFormat(android.graphics.PixelFormat.TRANSLUCENT);
-                            win.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+                            if (!stockFs) {
+                                win.setFormat(android.graphics.PixelFormat.TRANSLUCENT);
+                                win.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+                            }
                             android.view.WindowManager.LayoutParams wlp = win.getAttributes();
                             wlp.alpha = 0f;
                             win.setAttributes(wlp);
@@ -258,6 +299,19 @@ public final class SubscreenCenterHook {
                     Activity act = (Activity) param.thisObject;
                     String clsName = act.getClass().getName();
                     if (!isSubScreenActivity(clsName)) {
+                        return;
+                    }
+                    if (isStockFullscreen(act)) {
+                        registerFinishReceiver(act);
+                        try {
+                            android.view.Window win = act.getWindow();
+                            if (win != null) {
+                                android.view.WindowManager.LayoutParams wlp = win.getAttributes();
+                                wlp.alpha = 0f;
+                                win.setAttributes(wlp);
+                            }
+                        } catch (Throwable ignored) {
+                        }
                         return;
                     }
                     // 严防合盖后被 WindowManager 重排到 displayId=0（合盖外屏/主屏）
@@ -276,6 +330,18 @@ public final class SubscreenCenterHook {
                     if (!isSubScreenActivity(act.getClass().getName())) {
                         return;
                     }
+                    if (isStockFullscreen(act)) {
+                        sTrackedActivityRef = new WeakReference<>(act);
+                        sMainHandler.post(() -> {
+                            fadeInWindow(act, 40L, 320L);
+                            resetIdleTimeout(act);
+                            registerBackProximity(act);
+                            if (getRearVideoPlayMode(act) == 2) {
+                                replayTrackedVideos("screen_on_fullscreen");
+                            }
+                        });
+                        return;
+                    }
                     if (finishIfNotOnSecondaryDisplay(act)) {
                         return;
                     }
@@ -285,6 +351,9 @@ public final class SubscreenCenterHook {
                         resetIdleTimeout(act);
                         registerBackProximity(act);
                         registerGravityAutoRotate(act);
+                        if (getRearVideoPlayMode(act) == 2) {
+                            replayTrackedVideos("screen_on_half");
+                        }
                     });
                 }
             });
@@ -305,7 +374,7 @@ public final class SubscreenCenterHook {
                 }
             });
 
-            // 双击下方空白/毛玻璃区域退出背屏；右边缘或下方区域左滑直接打开 Flip 2 原厂外屏自拍；任意触摸重置息屏超时
+            // 双击下方空白/毛玻璃区域退出背屏；引导页左滑相机步骤轻点直接跳过；任意触摸重置息屏超时
             XposedHelpers.findAndHookMethod(Activity.class, "dispatchTouchEvent", MotionEvent.class, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -314,7 +383,7 @@ public final class SubscreenCenterHook {
                         return;
                     }
                     // 背屏触摸锁定：仅在内屏展开且外屏作为背屏显示（displayId=1）时吞掉外屏全部触摸，
-                    // 合盖全屏模式（displayId=0）与内屏触控完全不受影响
+                    // 合盖全屏模式（displayId=0）、内屏息屏/支架模式与内屏触控完全不受影响
                     if (isRearTouchLocked(act) && isRearDisplay(act)) {
                         param.setResult(Boolean.TRUE);
                         return;
@@ -322,20 +391,36 @@ public final class SubscreenCenterHook {
                     MotionEvent ev = (MotionEvent) param.args[0];
                     if (ev != null) {
                         int actMask = ev.getActionMasked();
+                        if (isStockFullscreen(act)) {
+                            // 全屏原厂视口模式下不拦截下方点击，按下重置超时，引导相机步骤轻点跳过，短点按模式重播视频/Live图
+                            if (actMask == MotionEvent.ACTION_DOWN) {
+                                sTouchDownX = ev.getRawX();
+                                sTouchDownY = ev.getRawY();
+                                sTouchDownTime = System.currentTimeMillis();
+                                resetIdleTimeout(act);
+                            } else if (actMask == MotionEvent.ACTION_UP) {
+                                if (trySkipGuideCameraStep(act, ev)) {
+                                    param.setResult(Boolean.TRUE);
+                                    return;
+                                }
+                                tryReplayStoppedVideoOnTap(act, ev);
+                            }
+                            return;
+                        }
+                        boolean isFlipped = (sCurrentContentRotation == 180);
+                        boolean inBlankArea = isFlipped
+                                ? (ev.getRawY() < OUTER_PHYSICAL_HEIGHT - TARGET_HEIGHT)
+                                : (ev.getRawY() > TARGET_HEIGHT + sBurnShiftY);
                         if (actMask == MotionEvent.ACTION_UP) {
+                            // 官方新手引导的左滑相机步骤：轻点一下直接跳过到下一步
+                            if (trySkipGuideCameraStep(act, ev)) {
+                                param.setResult(Boolean.TRUE);
+                                return;
+                            }
                             // 每次滑动/点击结束后 45ms 立即重采样毛玻璃色彩，消除切卡/切主题延迟
                             triggerImmediateGlassRefresh(45L);
-                            // 检测左滑打开外屏自拍（右侧边缘起滑 或 下方空白/毛玻璃区左滑，不与上方卡片切换冲突）
-                            float dx = sTouchDownX - ev.getRawX();
-                            float dy = Math.abs(ev.getRawY() - sTouchDownY);
-                            long dt = System.currentTimeMillis() - sTouchDownTime;
-                            boolean inSwipeZone = (sTouchDownX >= TARGET_WIDTH - 160)
-                                    || (sTouchDownY > TARGET_HEIGHT + sBurnShiftY);
-                            if (inSwipeZone && dx > 180f && dy < 180f && dt < 500L && isSwipeCameraEnabled(act)) {
-                                XposedBridge.log(TAG + ": left-swipe detected -> launching Flip 2 outer selfie camera");
-                                launchOuterSelfieCamera(act);
-                                param.setResult(Boolean.TRUE);
-                            }
+                            // 短点重播已停在尾帧的视频/Live图壁纸（仅在「点击重播」模式）
+                            tryReplayStoppedVideoOnTap(act, ev);
                         } else if (actMask == MotionEvent.ACTION_CANCEL) {
                             triggerImmediateGlassRefresh(120L);
                         } else if (actMask == MotionEvent.ACTION_DOWN) {
@@ -343,7 +428,7 @@ public final class SubscreenCenterHook {
                             sTouchDownY = ev.getRawY();
                             sTouchDownTime = System.currentTimeMillis();
                             resetIdleTimeout(act);
-                            if (ev.getRawY() > TARGET_HEIGHT + sBurnShiftY) {
+                            if (inBlankArea) {
                                 long now = System.currentTimeMillis();
                                 if (now - sLastBlackTapTime <= 400L) {
                                     sLastBlackTapTime = 0L;
@@ -365,6 +450,7 @@ public final class SubscreenCenterHook {
             installRearTouchLock(cl);
             installRearWindowTouchable(cl);
             installRearVideoLoop(cl);
+            installGuidePanelHook(cl);
 
             XposedBridge.log(TAG + ": camera-aligned viewport + black-area double-tap exit + burn-in shift + touch-lock + video-loop armed");
         } catch (Throwable t) {
@@ -383,8 +469,10 @@ public final class SubscreenCenterHook {
     private static final long SETTING_CACHE_MS = 250L;
     private static volatile boolean sTouchLockEnabled = false;
     private static volatile long sTouchLockCheckedAt = 0L;
-    private static volatile boolean sVideoLoopEnabled = false;
-    private static volatile long sVideoLoopCheckedAt = 0L;
+    private static volatile int sVideoPlayMode = 1; // 0=循环, 1=点击重播(默认), 2=亮屏一次, 3=仅播一次
+    private static volatile long sVideoPlayModeCheckedAt = 0L;
+    private static volatile boolean sStockFullscreenEnabled = false;
+    private static volatile long sStockFullscreenCheckedAt = 0L;
 
     private static final java.util.ArrayList<WeakReference<Object>> sVideoViews = new java.util.ArrayList<>();
 
@@ -569,7 +657,31 @@ public final class SubscreenCenterHook {
         }
     }
 
+    /**
+     * 外屏处于「弯折支架模式（内屏已关闭、只留背屏）」时，内屏本身已熄灭不存在误触，
+     * 自动放行背屏触摸以便用户正常上下左右滑切卡与交互。
+     */
+    private static boolean isInnerDisplayOff(Context ctx) {
+        try {
+            if (ctx == null) {
+                return false;
+            }
+            DisplayManager dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm != null) {
+                Display d0 = dm.getDisplay(0);
+                if (d0 != null && d0.getState() == Display.STATE_OFF) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
     private static boolean isRearTouchLocked(Context ctx) {
+        if (isInnerDisplayOff(ctx != null ? ctx : currentContext())) {
+            return false;
+        }
         long now = System.currentTimeMillis();
         if (now - sTouchLockCheckedAt > SETTING_CACHE_MS) {
             boolean v = false;
@@ -590,31 +702,45 @@ public final class SubscreenCenterHook {
         return sTouchLockEnabled;
     }
 
-    private static boolean isRearVideoLoopEnabled(Context ctx) {
+    /**
+     * 读取相册轮播/签名视频与 Live 图播放模式：
+     * 0 = 循环播放, 1 = 点击重播(默认), 2 = 亮屏播一次, 3 = 仅播一次
+     */
+    private static int getRearVideoPlayMode(Context ctx) {
         long now = System.currentTimeMillis();
-        if (now - sVideoLoopCheckedAt > SETTING_CACHE_MS) {
-            boolean v = false;
+        if (now - sVideoPlayModeCheckedAt > SETTING_CACHE_MS) {
+            int mode = 1;
             try {
                 Context c = ctx != null ? ctx : currentContext();
                 if (c != null) {
-                    v = Settings.Global.getInt(c.getContentResolver(),
-                            UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP, 0) == 1;
+                    int m = Settings.Global.getInt(c.getContentResolver(),
+                            UnfoldOuterDisplayHook.KEY_REAR_VIDEO_PLAY_MODE, -1);
+                    if (m >= 0 && m <= 3) {
+                        mode = m;
+                    } else {
+                        // 兼容旧版 KEY_REAR_VIDEO_LOOP
+                        mode = Settings.Global.getInt(c.getContentResolver(),
+                                UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP, 0) == 1 ? 0 : 1;
+                    }
                 }
             } catch (Throwable ignored) {
             }
-            if (v != sVideoLoopEnabled) {
-                XposedBridge.log(TAG + ": rear video loop -> " + (v ? "ON" : "OFF"));
-                if (!v) {
-                    // 开 -> 关：立刻把在播的播放器恢复为非循环，无需重开背屏
-                    for (Object view : snapshotVideoViews()) {
-                        applyVideoLooping(view, false);
-                    }
+            if (mode != sVideoPlayMode) {
+                XposedBridge.log(TAG + ": rear video play mode -> " + mode
+                        + " (0=loop,1=tap,2=screenOn,3=once)");
+                boolean loop = (mode == 0);
+                for (Object view : snapshotVideoViews()) {
+                    applyVideoLooping(view, loop);
                 }
             }
-            sVideoLoopEnabled = v;
-            sVideoLoopCheckedAt = now;
+            sVideoPlayMode = mode;
+            sVideoPlayModeCheckedAt = now;
         }
-        return sVideoLoopEnabled;
+        return sVideoPlayMode;
+    }
+
+    private static boolean isRearVideoLoopEnabled(Context ctx) {
+        return getRearVideoPlayMode(ctx) == 0;
     }
 
     /** VideoElement 自身不持有 Context，通过 mView(IVideoHolder).getView() 取所在 View。 */
@@ -638,10 +764,39 @@ public final class SubscreenCenterHook {
     private static Context currentContext() {
         try {
             Activity a = sTrackedActivityRef != null ? sTrackedActivityRef.get() : null;
-            return a;
+            if (a != null) {
+                return a;
+            }
+            Activity r = sRearActRef != null ? sRearActRef.get() : null;
+            if (r != null) {
+                return r;
+            }
+            Class<?> atCls = Class.forName("android.app.ActivityThread");
+            return (Context) XposedHelpers.callStaticMethod(atCls, "currentApplication");
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    private static boolean isStockFullscreen(Context ctx) {
+        long now = System.currentTimeMillis();
+        if (now - sStockFullscreenCheckedAt > SETTING_CACHE_MS) {
+            boolean v = false;
+            try {
+                Context c = ctx != null ? ctx : currentContext();
+                if (c != null) {
+                    v = Settings.Global.getInt(c.getContentResolver(),
+                            UnfoldOuterDisplayHook.KEY_REAR_STOCK_FULLSCREEN, 0) == 1;
+                }
+            } catch (Throwable ignored) {
+            }
+            if (v != sStockFullscreenEnabled) {
+                XposedBridge.log(TAG + ": stock fullscreen viewport -> " + (v ? "ON (native fullscreen)" : "OFF (1208x738 camera-aligned)"));
+            }
+            sStockFullscreenEnabled = v;
+            sStockFullscreenCheckedAt = now;
+        }
+        return sStockFullscreenEnabled;
     }
 
     private static void trackVideoView(Object view) {
@@ -659,6 +814,35 @@ public final class SubscreenCenterHook {
             }
             sVideoViews.add(new WeakReference<>(view));
         }
+    }
+
+    /** 视频/Live图壁纸在「点击重播(mode=1)」模式停在尾帧时，轻点外屏即可从头重新播放一次。 */
+    private static void tryReplayStoppedVideoOnTap(Activity act, MotionEvent ev) {
+        if (act == null || ev == null || getRearVideoPlayMode(act) != 1) {
+            return;
+        }
+        float dx = Math.abs(ev.getRawX() - sTouchDownX);
+        float dy = Math.abs(ev.getRawY() - sTouchDownY);
+        long dt = System.currentTimeMillis() - sTouchDownTime;
+        if (dt > 300L || dx > 28f || dy > 28f) {
+            return;
+        }
+        replayTrackedVideos("tap");
+    }
+
+    private static void replayTrackedVideos(String reason) {
+        java.util.List<Object> views = snapshotVideoViews();
+        if (views.isEmpty()) {
+            return;
+        }
+        for (Object holder : views) {
+            try {
+                XposedHelpers.callMethod(holder, "seekTo", 0);
+                XposedHelpers.callMethod(holder, "start");
+            } catch (Throwable ignored) {
+            }
+        }
+        XposedBridge.log(TAG + ": " + reason + " -> replayed " + views.size() + " rear video/live wallpaper(s) from head");
     }
 
     private static java.util.List<Object> snapshotVideoViews() {
@@ -840,26 +1024,41 @@ public final class SubscreenCenterHook {
             if (sm == null) {
                 return;
             }
-            Sensor backProx = sm.getDefaultSensor(BACK_PROXIMITY_SENSOR_TYPE, false);
+            // 优先用外屏接近的原始流 33171124：贴桌时 v0≈1023（满量程饱和）；包装值 33171123 仅作回退
+            Sensor backProx = findSensorByType(sm, BACK_PROX_FACTORY_TYPE);
+            final boolean factoryRaw = backProx != null;
             if (backProx == null) {
-                backProx = sm.getDefaultSensor(BACK_PROXIMITY_SENSOR_TYPE, true);
+                backProx = sm.getDefaultSensor(BACK_PROXIMITY_SENSOR_TYPE, false);
+                if (backProx == null) {
+                    backProx = sm.getDefaultSensor(BACK_PROXIMITY_SENSOR_TYPE, true);
+                }
             }
             if (backProx == null) {
                 return;
             }
             sSensorManager = sm;
+            sLastBackProxNear = null;
             sBackProxListener = new SensorEventListener() {
                 @Override
                 public void onSensorChanged(SensorEvent event) {
                     if (event == null || event.values == null || event.values.length == 0) {
                         return;
                     }
-                    boolean near = event.values[0] < 1.0f;
-                    if (near) {
-                        sMainHandler.removeCallbacks(sTableOffRunnable);
-                        sMainHandler.postDelayed(sTableOffRunnable, 1500L);
-                    } else {
-                        sMainHandler.removeCallbacks(sTableOffRunnable);
+                    boolean near = factoryRaw
+                            ? event.values[0] >= BACK_PROX_FACTORY_NEAR
+                            : event.values[0] < 1.0f;
+                    // 原始流为 200ms 连续上报，仅在状态翻转时调度/取消 1.5s 定时器，避免被持续推迟永不触发
+                    if (sLastBackProxNear == null || sLastBackProxNear != near) {
+                        sLastBackProxNear = near;
+                        XposedBridge.log(TAG + ": backProx" + (factoryRaw ? "[raw]" : "[std]")
+                                + " v0=" + event.values[0] + " near=" + near
+                                + (near ? " -> schedule table-off in 1.5s" : " -> cancel table-off"));
+                        if (near) {
+                            sMainHandler.removeCallbacks(sTableOffRunnable);
+                            sMainHandler.postDelayed(sTableOffRunnable, 1500L);
+                        } else {
+                            sMainHandler.removeCallbacks(sTableOffRunnable);
+                        }
                     }
                 }
 
@@ -868,9 +1067,27 @@ public final class SubscreenCenterHook {
                 }
             };
             sm.registerListener(sBackProxListener, backProx, SensorManager.SENSOR_DELAY_NORMAL);
+            XposedBridge.log(TAG + ": registerBackProximity OK -> " + (factoryRaw ? "RAW " : "STD ") + backProx.getName());
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": registerBackProximity failed: " + t);
         }
+    }
+
+    /** factory 隐藏传感器 getDefaultSensor 取不到，需遍历 TYPE_ALL 按 type 精确匹配 */
+    private static Sensor findSensorByType(SensorManager sm, int type) {
+        try {
+            java.util.List<Sensor> all = sm.getSensorList(Sensor.TYPE_ALL);
+            if (all != null) {
+                for (Sensor s : all) {
+                    if (s.getType() == type && !s.isWakeUpSensor()) {
+                        return s;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": findSensorByType(" + type + ") failed: " + t);
+        }
+        return null;
     }
 
     private static void unregisterBackProximity() {
@@ -883,45 +1100,103 @@ public final class SubscreenCenterHook {
         sBackProxListener = null;
     }
 
+    private static Runnable sRotateDebounceRunnable;
+    private static int sPendingRotationTarget = 0;
+
+    private static int getFlipAlignMode(Context ctx) {
+        try {
+            Context c = ctx != null ? ctx : currentContext();
+            if (c != null) {
+                return Settings.Global.getInt(c.getContentResolver(), UnfoldOuterDisplayHook.KEY_REAR_FLIP_ALIGN, 0);
+            }
+        } catch (Throwable ignored) {
+        }
+        return 0;
+    }
+
+    private static void applyContentRotationAndAlignment(View content, int rot, boolean animate) {
+        if (content == null || !content.isAttachedToWindow()) {
+            return;
+        }
+        int alignMode = getFlipAlignMode(content.getContext());
+        if (alignMode == 2) {
+            rot = 0; // 关闭翻转：保持 0° 正向
+        }
+        sCurrentContentRotation = rot;
+        int cw = content.getWidth();
+        int ch = content.getHeight();
+        if (cw > 0 && ch > 0) {
+            content.setPivotX(cw * 0.5f);
+            content.setPivotY(ch * 0.5f);
+        }
+        // 正向 0°：左侧 410px 留给双摄、内容右贴；
+        // 倒置 180°（含弯折时摄像头朝下、内容朝上）：
+        //   alignMode==0 (贴左避让): translationX=+410 贴左、右侧留空给双摄；
+        //   alignMode==1 (居中满幅): translationX=0 全宽居中。
+        float targetX = (rot == 180 && alignMode == 0) ? CAMERA_SAFE_LEFT_PX : 0f;
+        float targetY = (rot == 180)
+                ? (OUTER_PHYSICAL_HEIGHT - TARGET_HEIGHT)
+                : sBurnShiftY;
+        if (animate) {
+            content.animate().rotation(rot).translationX(targetX).translationY(targetY).setDuration(280L).start();
+            triggerImmediateGlassRefresh(320L);
+        } else {
+            content.animate().cancel();
+            content.setRotation(rot);
+            content.setTranslationX(targetX);
+            content.setTranslationY(targetY);
+        }
+    }
+
     private static void registerGravityAutoRotate(Activity act) {
         unregisterGravityAutoRotate();
         if (act == null) {
             return;
         }
         try {
-            if (Settings.Global.getInt(act.getContentResolver(), UnfoldOuterDisplayHook.KEY_REAR_AUTO_ROTATE, 1) != 1) {
-                sCurrentContentRotation = 0;
+            // 半折状态（弯折支架/桌钟）固定旋转 180°（摄像头朝下，内容自动贴左避让右侧双摄）
+            if (sIsHalfOpen) {
+                sPendingRotationTarget = 180;
                 View content = sTrackedContentRef != null ? sTrackedContentRef.get() : null;
-                if (content != null) {
-                    content.setRotation(0f);
-                }
+                applyContentRotationAndAlignment(content, 180, false);
+                return;
+            }
+            // 默认关闭重力自动倒置旋转（0），避免倾斜握持时角度抖动误翻转
+            if (Settings.Global.getInt(act.getContentResolver(), UnfoldOuterDisplayHook.KEY_REAR_AUTO_ROTATE, 0) != 1) {
+                sPendingRotationTarget = 0;
+                View content = sTrackedContentRef != null ? sTrackedContentRef.get() : null;
+                applyContentRotationAndAlignment(content, 0, false);
                 return;
             }
             sOrientationListener = new android.view.OrientationEventListener(act, SensorManager.SENSOR_DELAY_NORMAL) {
                 @Override
                 public void onOrientationChanged(int orientation) {
-                    if (orientation == android.view.OrientationEventListener.ORIENTATION_UNKNOWN) {
+                    if (sIsHalfOpen || orientation == android.view.OrientationEventListener.ORIENTATION_UNKNOWN) {
                         return;
                     }
-                    // 滞回区间：正向(315°..360° / 0°..45°) -> 0°，倒置(135°..225°) -> 180°
-                    int target = sCurrentContentRotation;
-                    if (orientation >= 140 && orientation <= 220) {
+                    // 严格滞回区间 + 600ms 稳定防抖：正向(325°..360° / 0°..35°) -> 0°，倒置(145°..215°) -> 180°
+                    int target = sPendingRotationTarget;
+                    if (orientation >= 145 && orientation <= 215) {
                         target = 180;
-                    } else if (orientation <= 40 || orientation >= 320) {
+                    } else if (orientation <= 35 || orientation >= 325) {
                         target = 0;
+                    } else {
+                        return;
                     }
-                    if (target != sCurrentContentRotation) {
-                        sCurrentContentRotation = target;
+                    if (target != sPendingRotationTarget) {
+                        sPendingRotationTarget = target;
+                        if (sRotateDebounceRunnable != null) {
+                            sMainHandler.removeCallbacks(sRotateDebounceRunnable);
+                        }
                         final int rot = target;
-                        sMainHandler.post(() -> {
-                            View content = sTrackedContentRef != null ? sTrackedContentRef.get() : null;
-                            if (content != null && content.isAttachedToWindow()) {
-                                content.setPivotX(content.getWidth() * 0.5f);
-                                content.setPivotY(content.getHeight() * 0.5f);
-                                content.animate().rotation(rot).setDuration(280L).start();
-                                triggerImmediateGlassRefresh(320L);
+                        sRotateDebounceRunnable = () -> {
+                            if (sIsHalfOpen || rot == sCurrentContentRotation) {
+                                return;
                             }
-                        });
+                            View content = sTrackedContentRef != null ? sTrackedContentRef.get() : null;
+                            applyContentRotationAndAlignment(content, rot, true);
+                        };
+                        sMainHandler.postDelayed(sRotateDebounceRunnable, 600L);
                     }
                 }
             };
@@ -934,6 +1209,10 @@ public final class SubscreenCenterHook {
     }
 
     private static void unregisterGravityAutoRotate() {
+        if (sRotateDebounceRunnable != null) {
+            sMainHandler.removeCallbacks(sRotateDebounceRunnable);
+            sRotateDebounceRunnable = null;
+        }
         try {
             if (sOrientationListener != null) {
                 sOrientationListener.disable();
@@ -952,44 +1231,117 @@ public final class SubscreenCenterHook {
         }
     }
 
-    private static boolean isSwipeCameraEnabled(Context ctx) {
+    /**
+     * 防止 GuidePanel.E() 首次 onResume 时调用 PowerManager.goToSleep() 直接把整机息屏（y0=false），
+     * 让用户在 Flip 2 展开态或调试入口拉起官方背屏引导时保持亮屏可交互。
+     */
+    private static void installGuidePanelHook(ClassLoader cl) {
         try {
-            return ctx != null && Settings.Global.getInt(
-                    ctx.getContentResolver(), UnfoldOuterDisplayHook.KEY_REAR_SWIPE_CAMERA, 1) == 1;
-        } catch (Throwable ignored) {
-            return true;
+            Class<?> gpCls = XposedHelpers.findClass("com.xiaomi.subscreencenter.guide.GuidePanel", cl);
+            XposedHelpers.findAndHookMethod(gpCls, "E", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        XposedHelpers.setBooleanField(param.thisObject, "y0", false);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": hooked GuidePanel.E() to suppress initial goToSleep");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": hook GuidePanel.E() failed: " + t);
         }
     }
 
-    private static void launchOuterSelfieCamera(Activity act) {
-        if (act == null) {
+    /**
+     * 官方新手引导（GuideActivity）中「左滑开启相机」步骤（GuidePanel.v0 == 0 或 1）：
+     * 轻点一下直接隐藏当前引导并跳过到下一步（O() -> N()），避免被 Flip 2 相机限制卡住。
+     */
+    private static boolean trySkipGuideCameraStep(Activity act, MotionEvent ev) {
+        if (act == null || ev == null || !"com.xiaomi.subscreencenter.guide.GuideActivity".equals(act.getClass().getName())) {
+            return false;
+        }
+        float dx = Math.abs(ev.getRawX() - sTouchDownX);
+        float dy = Math.abs(ev.getRawY() - sTouchDownY);
+        long dt = System.currentTimeMillis() - sTouchDownTime;
+        if (dt > 350L || dx > 42f || dy > 42f) {
+            return false;
+        }
+        try {
+            Object panel = XposedHelpers.getObjectField(act, "w");
+            if (panel == null) {
+                return false;
+            }
+            int stage = XposedHelpers.getIntField(panel, "v0");
+            if (stage == 0 || stage == 1) {
+                XposedBridge.log(TAG + ": GuideActivity camera stage=" + stage + " tapped -> skipping directly to next stage");
+                try {
+                    XposedHelpers.callMethod(panel, "O");
+                } catch (Throwable ignored) {
+                }
+                XposedHelpers.callMethod(panel, "N");
+                return true;
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": trySkipGuideCameraStep failed: " + t);
+        }
+        return false;
+    }
+
+    private static void fadeInWindow(Activity act, long delayMs, long durationMs) {
+        if (act == null || act.isFinishing()) {
+            return;
+        }
+        final android.view.Window win = act.getWindow();
+        if (win == null) {
             return;
         }
         try {
-            int targetDisplayId = 1;
-            Display d = act.getDisplay();
-            if (d != null) {
-                targetDisplayId = d.getDisplayId();
+            if (sWindowFadeAnimator != null) {
+                sWindowFadeAnimator.cancel();
             }
-            Intent cam = new Intent(android.provider.MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA_SECURE);
-            cam.setPackage("com.android.camera");
-            cam.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-            android.app.ActivityOptions opts = android.app.ActivityOptions.makeBasic();
-            opts.setLaunchDisplayId(targetDisplayId);
-            act.startActivity(cam, opts.toBundle());
-        } catch (Throwable t) {
-            try {
-                Intent fallback = new Intent();
-                fallback.setClassName("com.android.camera", "com.android.camera.Camera");
-                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                act.startActivity(fallback);
-            } catch (Throwable t2) {
-                XposedBridge.log(TAG + ": launchOuterSelfieCamera failed: " + t2);
+            android.view.WindowManager.LayoutParams wlp = win.getAttributes();
+            wlp.alpha = 0f;
+            win.setAttributes(wlp);
+            View decor = win.getDecorView();
+            Runnable startAnim = () -> {
+                if (act.isFinishing()) {
+                    return;
+                }
+                if (sWindowFadeAnimator != null) {
+                    sWindowFadeAnimator.cancel();
+                }
+                android.animation.ValueAnimator va = android.animation.ValueAnimator.ofFloat(0f, 1f);
+                va.setDuration(durationMs);
+                va.setInterpolator(new android.view.animation.DecelerateInterpolator(1.8f));
+                va.addUpdateListener(a -> {
+                    try {
+                        if (act.isFinishing()) {
+                            return;
+                        }
+                        android.view.WindowManager.LayoutParams lp = win.getAttributes();
+                        lp.alpha = (Float) a.getAnimatedValue();
+                        win.setAttributes(lp);
+                    } catch (Throwable ignored) {
+                    }
+                });
+                sWindowFadeAnimator = va;
+                va.start();
+            };
+            if (decor != null) {
+                decor.postDelayed(startAnim, delayMs);
+            } else {
+                sMainHandler.postDelayed(startAnim, delayMs);
             }
+        } catch (Throwable ignored) {
         }
     }
 
     private static void fadeOutAndFinish(Activity act) {
+        fadeOutAndFinish(act, 320L);
+    }
+
+    private static void fadeOutAndFinish(Activity act, long durationMs) {
         if (act == null || act.isFinishing()) {
             return;
         }
@@ -1002,7 +1354,7 @@ public final class SubscreenCenterHook {
                 }
                 final float startAlpha = win.getAttributes() != null ? win.getAttributes().alpha : 1f;
                 android.animation.ValueAnimator va = android.animation.ValueAnimator.ofFloat(startAlpha, 0f);
-                va.setDuration(420L);
+                va.setDuration(durationMs);
                 va.setInterpolator(new android.view.animation.DecelerateInterpolator(1.8f));
                 va.addUpdateListener(a -> {
                     try {
@@ -1083,15 +1435,35 @@ public final class SubscreenCenterHook {
                 return;
             }
             IntentFilter filter = new IntentFilter(UnfoldOuterDisplayHook.ACTION_FINISH_REAR_LAUNCHER);
+            filter.addAction(UnfoldOuterDisplayHook.ACTION_HALF_OPEN_STATE);
             appCtx.registerReceiver(new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
+                    String action = intent != null ? intent.getAction() : null;
+                    if (UnfoldOuterDisplayHook.ACTION_HALF_OPEN_STATE.equals(action)) {
+                        boolean half = intent.getBooleanExtra(UnfoldOuterDisplayHook.EXTRA_HALF_OPEN, false);
+                        sIsHalfOpen = half;
+                        XposedBridge.log(TAG + ": half-open state -> " + half + " (lock 180deg=" + half + ")");
+                        sMainHandler.post(() -> {
+                            Activity a = sTrackedActivityRef != null ? sTrackedActivityRef.get() : null;
+                            View content = sTrackedContentRef != null ? sTrackedContentRef.get() : null;
+                            if (half) {
+                                applyContentRotationAndAlignment(content, 180, true);
+                            } else {
+                                applyContentRotationAndAlignment(content, 0, true);
+                                if (a != null && !a.isFinishing()) {
+                                    registerGravityAutoRotate(a);
+                                }
+                            }
+                        });
+                        return;
+                    }
                     Activity a = sTrackedActivityRef != null ? sTrackedActivityRef.get() : null;
                     if (a != null && !a.isFinishing()) {
                         boolean silent = intent != null && intent.getBooleanExtra(UnfoldOuterDisplayHook.EXTRA_SILENT_FINISH, false);
                         XposedBridge.log(TAG + ": received ACTION_FINISH_REAR_LAUNCHER (silent=" + silent + ") -> finish");
-                        if (!silent && isFoldedMode(a)) {
-                            fadeOutAndFinish(a);
+                        if (!silent) {
+                            fadeOutAndFinish(a, isFoldedMode(a) ? 380L : 220L);
                         } else {
                             sMainHandler.removeCallbacks(sGlassRefreshRunnable);
                             a.finishAndRemoveTask();
@@ -1487,6 +1859,9 @@ public final class SubscreenCenterHook {
     }
 
     private static final ThreadLocal<Boolean> sSpoofMadridNetwork = new ThreadLocal<>();
+    private static volatile boolean sInRearScreenThemePage = false;
+    private static volatile boolean sThemeEditorFullscreenMode = false;
+    private static final String EXTRA_MADRID_FULLSCREEN_CARD = "madrid_fullscreen_card";
 
     /**
      * HyperOS 4 的「轻敲背面」设置页在 com.miui.securitycore（h2.c Fragment），
@@ -1595,7 +1970,9 @@ public final class SubscreenCenterHook {
                             || "ro.product.name".equals(key)) {
                         for (StackTraceElement ste : Thread.currentThread().getStackTrace()) {
                             String cn = ste.getClassName();
-                            if (cn.contains("rearScreen") || cn.contains("aiapp") || cn.contains("AiApp")) {
+                            if (cn.contains("rearScreen") || cn.contains("RearScreen")
+                                    || cn.contains("subscreen") || cn.contains("SubScreen")
+                                    || cn.contains("aiapp") || cn.contains("AiApp")) {
                                 param.setResult("madrid");
                                 return;
                             }
@@ -1605,15 +1982,49 @@ public final class SubscreenCenterHook {
             };
             XposedHelpers.findAndHookMethod(spCls, "get", String.class, deviceSpoofHook);
             XposedHelpers.findAndHookMethod(spCls, "get", String.class, String.class, deviceSpoofHook);
-            XposedBridge.log(TAG + ": ThemeManager armed scoped madrid device spoof for RearScreenAiApp");
+            XposedBridge.log(TAG + ": ThemeManager armed scoped madrid device spoof for RearScreen");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": ThemeManager device spoof failed: " + t);
         }
 
-        // 修复 AI 应用卡社区列表「当前内容无法展示」：
-        // 拦截 ThemeManager OkHttp ParamInterceptor，在 AI_GENERATED_APP / rearScreen / aiapp 请求期间
-        // 将 DeviceUtils.y() -> "madrid"、cdj() -> "25098PN5AC"、t8r() -> "MIPHONE"、a() -> true，
-        // 仅作用于当前 OkHttp 请求线程，不影响 Flip 2 普通主题商店请求。
+        // 追踪用户是否正位于主题商店「个性背屏」相关页面（含相册轮播 / 签名 / AI壁纸 / 萌宠等），
+        // 处于这些页面期间，所有 OkHttp 与 OnlineService 请求统一伪装为 madrid，彻底根治「相册轮播网络异常」
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Activity a = (Activity) param.thisObject;
+                    if (a != null) {
+                        String cn = a.getClass().getName();
+                        if (cn.contains("rearScreen") || cn.contains("RearScreen")
+                                || cn.contains("subscreen") || cn.contains("SubScreen")
+                                || cn.contains("PersonalizedEditor") || cn.contains("personalizedEditor")) {
+                            sInRearScreenThemePage = true;
+                        }
+                    }
+                }
+            });
+            XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Activity a = (Activity) param.thisObject;
+                    if (a != null) {
+                        String cn = a.getClass().getName();
+                        if (cn.contains("rearScreen") || cn.contains("RearScreen")
+                                || cn.contains("subscreen") || cn.contains("SubScreen")
+                                || cn.contains("PersonalizedEditor") || cn.contains("personalizedEditor")) {
+                            sInRearScreenThemePage = false;
+                        }
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+
+        // 修复背屏个性化（相册轮播 / 签名 / AI 应用卡 / 萌宠等）云端请求「当前内容无法显示 / 网络异常」：
+        // 1) DeviceUtils.a() 恒返回 true，使 ParamInterceptor/OnlineService 正确上报 isSupportRearScreen=true 与 rearScreenVersion；
+        // 2) 拦截 ParamInterceptor，在背屏相关请求或处于背屏个性化页面期间将 device -> "madrid"、model -> "25098PN5AC"、deviceType -> "MIPHONE"；
+        //    不影响 Flip 2 普通主题商店首页请求。
         try {
             Class<?> paramIntCls = XposedHelpers.findClass(
                     "com.android.thememanager.basemodule.network.theme.interceptors.ParamInterceptor", cl);
@@ -1627,15 +2038,25 @@ public final class SubscreenCenterHook {
                         Object req = XposedHelpers.callMethod(param.args[0], "ld6");
                         Object urlObj = req != null ? XposedHelpers.callMethod(req, "cdj") : null;
                         String url = urlObj != null ? String.valueOf(urlObj) : "";
-                        boolean shouldSpoof = url.contains("AI_GENERATED_APP")
-                                || url.contains("rearScreen")
-                                || url.contains("rearscreen")
-                                || url.contains("aiapp")
-                                || url.contains("ai_app");
+                        String low = url.toLowerCase();
+                        boolean shouldSpoof = sInRearScreenThemePage
+                                || low.contains("ai_generated_app")
+                                || low.contains("rearscreen")
+                                || low.contains("rear_screen")
+                                || low.contains("rear_")
+                                || low.contains("subscreen")
+                                || low.contains("aiapp")
+                                || low.contains("ai_app")
+                                || low.contains("carousel")
+                                || low.contains("signature")
+                                || low.contains("cutepet")
+                                || low.contains("groupphoto");
                         if (!shouldSpoof) {
                             for (StackTraceElement ste : Thread.currentThread().getStackTrace()) {
                                 String cn = ste.getClassName();
-                                if (cn.contains("rearScreen") || cn.contains("aiapp") || cn.contains("AiApp")) {
+                                if (cn.contains("rearScreen") || cn.contains("RearScreen")
+                                        || cn.contains("subscreen") || cn.contains("SubScreen")
+                                        || cn.contains("aiapp") || cn.contains("AiApp")) {
                                     shouldSpoof = true;
                                     break;
                                 }
@@ -1660,7 +2081,7 @@ public final class SubscreenCenterHook {
             XposedHelpers.findAndHookMethod(devUtilsCls, "y", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    if (Boolean.TRUE.equals(sSpoofMadridNetwork.get())) {
+                    if (Boolean.TRUE.equals(sSpoofMadridNetwork.get()) || sInRearScreenThemePage) {
                         param.setResult("madrid");
                     }
                 }
@@ -1668,7 +2089,7 @@ public final class SubscreenCenterHook {
             XposedHelpers.findAndHookMethod(devUtilsCls, "cdj", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    if (Boolean.TRUE.equals(sSpoofMadridNetwork.get())) {
+                    if (Boolean.TRUE.equals(sSpoofMadridNetwork.get()) || sInRearScreenThemePage) {
                         param.setResult("25098PN5AC");
                     }
                 }
@@ -1676,20 +2097,15 @@ public final class SubscreenCenterHook {
             XposedHelpers.findAndHookMethod(devUtilsCls, "t8r", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    if (Boolean.TRUE.equals(sSpoofMadridNetwork.get())) {
+                    if (Boolean.TRUE.equals(sSpoofMadridNetwork.get()) || sInRearScreenThemePage) {
                         param.setResult("MIPHONE");
                     }
                 }
             });
-            XposedHelpers.findAndHookMethod(devUtilsCls, "a", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (Boolean.TRUE.equals(sSpoofMadridNetwork.get())) {
-                        param.setResult(Boolean.TRUE);
-                    }
-                }
-            });
-            XposedBridge.log(TAG + ": ThemeManager hooked ParamInterceptor + DeviceUtils for AI_GENERATED_APP community list");
+            // DeviceUtils.a() 表示设备支持独立背屏（isIndependentRearDevice），恒返回 true 避免 rearScreenVersion=0
+            XposedHelpers.findAndHookMethod(devUtilsCls, "a",
+                    XC_MethodReplacement.returnConstant(Boolean.TRUE));
+            XposedBridge.log(TAG + ": ThemeManager hooked ParamInterceptor + DeviceUtils for RearScreen cloud APIs");
 
             // 修复 AI 应用卡下载失败（fetchDownloadUrl: apiCode=-1）：
             // fetchDownloadUrl 走 OnlineService.a9() + NetworkHelper，不经过 OkHttp ParamInterceptor；
@@ -1717,20 +2133,317 @@ public final class SubscreenCenterHook {
             XposedBridge.log(TAG + ": ThemeManager ParamInterceptor hook failed: " + t);
         }
 
-        // 修复 AI 应用卡详情页预览区高度过大导致底部被裁切：
-        // AiAppPreviewContainer 按 RearScreenUtil.x2()（背屏宽高比）计算预览高度；
-        // Flip 2 物理比例 1208/1392=0.868 会把预览撑高到 1206px，改为小米 18 的 1208/738=1.637 后恢复 639px 标准比例。
+        // 修复背屏个性化（相册轮播 / 签名 / AI 应用卡详情预览）因 Flip 2 物理比例 1208/1392=0.868
+        // 被 RearScreenUtil 判定为 "unknown" 导致云端返回空（「当前内容无法显示」）：
+        // - 云端查询接口（qrj() / p()）始终返回 "3x2"，确保资源列表完整；
+        // - 预览与裁切比例（x2() / Companion.y()）按当前选中的卡片动态切换：
+        //   「半屏相册轮播和签名」= 1208×738 (1.637)，「全屏相册轮播和签名」= 1208×1392 (0.868)。
         try {
             Class<?> rsuCls = XposedHelpers.findClass("com.android.thememanager.basemodule.utils.RearScreenUtil", cl);
-            XposedHelpers.findAndHookMethod(rsuCls, "x2",
-                    XC_MethodReplacement.returnConstant(TARGET_WIDTH / (float) TARGET_HEIGHT));
-            XposedBridge.log(TAG + ": ThemeManager hooked RearScreenUtil.x2() -> 1208/738 (fix AiAppDetail bottom clipping)");
+            XC_MethodHook ratioHook = new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    float h = sThemeEditorFullscreenMode ? (float) OUTER_PHYSICAL_HEIGHT : (float) TARGET_HEIGHT;
+                    param.setResult(TARGET_WIDTH / h);
+                }
+            };
+            XposedHelpers.findAndHookMethod(rsuCls, "x2", ratioHook);
+            XposedHelpers.findAndHookMethod(rsuCls, "qrj",
+                    XC_MethodReplacement.returnConstant("3x2"));
+            XposedHelpers.findAndHookMethod(rsuCls, "p",
+                    XC_MethodReplacement.returnConstant("{\"size\":\"3x2\"}"));
+            Class<?> rsuCompCls = XposedHelpers.findClass("com.android.thememanager.basemodule.utils.RearScreenUtil$Companion", cl);
+            try {
+                XposedHelpers.findAndHookMethod(rsuCompCls, "x2", ratioHook);
+            } catch (Throwable ignored) {
+            }
+            XposedHelpers.findAndHookMethod(rsuCompCls, "y", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Object res = param.getResult();
+                    if (res instanceof android.util.DisplayMetrics) {
+                        android.util.DisplayMetrics dm = (android.util.DisplayMetrics) res;
+                        if (dm.widthPixels == TARGET_WIDTH) {
+                            dm.heightPixels = sThemeEditorFullscreenMode ? OUTER_PHYSICAL_HEIGHT : TARGET_HEIGHT;
+                        }
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": ThemeManager hooked RearScreenUtil -> dynamic half(1208x738) / full(1208x1392) preview + 3x2 cloud API");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": ThemeManager hook RearScreenUtil.x2 failed: " + t);
+            XposedBridge.log(TAG + ": ThemeManager hook RearScreenUtil failed: " + t);
+        }
+
+        // 官方背屏个性化卡片增强：
+        // 1) 将「壁纸与签名」/「相册轮播」改名为「半屏相册轮播和签名」（预览为半屏 1208×738）；
+        // 2) 克隆一组同名模块「全屏相册轮播和签名」（功能完全一致，进入预览/裁切时自动切换为全屏 1208×1392）；
+        // 3) 将「选择图片」等文案替换为「选择图片、视频和 Live 图」。
+        hookThemeManagerHalfAndFullCards(cl);
+
+        // 解锁官方背屏相册选择器直接选择「视频」与「Live 动态照片」：
+        // 1) RearScreenFunction.toq() (isRearScreenSupportVideo) 与 LivePhotoUtils.n() 恒返回 true；
+        // 2) ThirdPartyIntentUtils.cdj(activity, imageOnly, ...) 在背屏编辑/相册轮播场景下强制 imageOnly=false，
+        //    使相册选择器 MIME 类型变为 "image/*, video/*"，原生支持选照片、Live 实况图与视频。
+        try {
+            Class<?> rsfCls = XposedHelpers.findClass("com.rearScreen.manager.RearScreenFunction", cl);
+            XposedHelpers.findAndHookMethod(rsfCls, "toq", XC_MethodReplacement.returnConstant(Boolean.TRUE));
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": ThemeManager hook RearScreenFunction.toq failed: " + t);
+        }
+        try {
+            Class<?> lpuCls = XposedHelpers.findClass("com.android.thememanager.util.LivePhotoUtils", cl);
+            XposedHelpers.findAndHookMethod(lpuCls, "n", XC_MethodReplacement.returnConstant(Boolean.TRUE));
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": ThemeManager hook LivePhotoUtils.n failed: " + t);
+        }
+        try {
+            Class<?> tpiCls = XposedHelpers.findClass("com.android.thememanager.basemodule.utils.ThirdPartyIntentUtils", cl);
+            XposedBridge.hookAllMethods(tpiCls, "cdj", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args == null || param.args.length < 2 || !(param.args[1] instanceof Boolean)) {
+                        return;
+                    }
+                    if (!(Boolean) param.args[1]) {
+                        return;
+                    }
+                    boolean isRearPicker = sInRearScreenThemePage;
+                    if (!isRearPicker) {
+                        for (StackTraceElement ste : Thread.currentThread().getStackTrace()) {
+                            String cn = ste.getClassName();
+                            if (cn.contains("rearScreen") || cn.contains("RearScreen")
+                                    || cn.contains("AlbumPickerHelper") || cn.contains("JumpRouter")) {
+                                isRearPicker = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (isRearPicker) {
+                        param.args[1] = Boolean.FALSE; // imageOnly=false -> "image/*, video/*"
+                        XposedBridge.log(TAG + ": unlocked video & Live Photo in rear screen gallery picker");
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": ThemeManager hooked ThirdPartyIntentUtils.cdj for video & Live Photo picker");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": ThemeManager hook ThirdPartyIntentUtils.cdj failed: " + t);
+        }
+
+        // 隐藏 MIX Flip 2 硬件不支持的「背屏息屏显示（AodAssistantController）」入口（合盖走 Flip 2 原厂外屏 AOD）
+        try {
+            Class<?> aodCtrlCls = XposedHelpers.findClass("com.rearScreen.subscreen.AodAssistantController", cl);
+            XposedHelpers.findAndHookMethod(aodCtrlCls, "k", XC_MethodReplacement.returnConstant(Boolean.FALSE));
+            XposedBridge.log(TAG + ": ThemeManager hidden unsupported AodAssistantController (rear AOD)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": ThemeManager hide AodAssistantController failed: " + t);
         }
 
         // 修复「个性背屏」亮度条（用 Flip 2 动态浮点映射直连 DisplayManager(1)）并隐藏失效的「阳光屏」开关
         hookThemeManagerRearBrightness(cl);
+    }
+
+    private static void hookThemeManagerHalfAndFullCards(ClassLoader cl) {
+        // 1. Hook RearScreenListViewModel.r8s8(ArrayList)：在本地预设 + 云端在线（含相册轮播）全部合并完成后统一处理：
+        //    - 「壁纸与签名」(signature) -> 「半屏壁纸与签名」 + 克隆「全屏壁纸与签名」(categoryType="signature_fullscreen")
+        //    - 「相册轮播」(carousel)  -> 「半屏相册轮播」   + 克隆「全屏相册轮播」(categoryType="carousel_fullscreen")
+        //    使用独立 categoryType 避免被 ViewModel/DiffUtil 合并覆盖，每张克隆卡片打标 madrid_fullscreen_card=true。
+        try {
+            Class<?> vmCls = XposedHelpers.findClass("com.rearScreen.viewModel.RearScreenListViewModel", cl);
+            XposedBridge.hookAllMethods(vmCls, "r8s8", new XC_MethodHook() {
+                @Override
+                @SuppressWarnings("unchecked")
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args == null || param.args.length < 1 || !(param.args[0] instanceof java.util.List)) {
+                        return;
+                    }
+                    java.util.List<Object> list = (java.util.List<Object>) param.args[0];
+                    boolean hasFullSig = false;
+                    boolean hasFullCar = false;
+                    for (Object cat : list) {
+                        if (cat == null) continue;
+                        try {
+                            String t = (String) XposedHelpers.callMethod(cat, "getCategoryType");
+                            if ("signature_fullscreen".equals(t)) hasFullSig = true;
+                            if ("carousel_fullscreen".equals(t)) hasFullCar = true;
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    java.util.ArrayList<Object> toInsert = new java.util.ArrayList<>();
+                    java.util.ArrayList<Integer> insertPositions = new java.util.ArrayList<>();
+                    for (int i = 0; i < list.size(); i++) {
+                        Object cat = list.get(i);
+                        if (cat == null) continue;
+                        try {
+                            String type = (String) XposedHelpers.callMethod(cat, "getCategoryType");
+                            String name = (String) XposedHelpers.callMethod(cat, "getCategoryName");
+                            boolean isSig = "signature".equals(type) || (name != null && name.contains("壁纸与签名"));
+                            boolean isCar = "carousel".equals(type) || (name != null && name.contains("相册轮播"));
+                            if (!isSig && !isCar) {
+                                continue;
+                            }
+                            if (isSig && hasFullSig) continue;
+                            if (isCar && hasFullCar) continue;
+                            String halfTitle = isCar ? "半屏相册轮播" : "半屏壁纸与签名";
+                            String fullTitle = isCar ? "全屏相册轮播" : "全屏壁纸与签名";
+                            String fullType = isCar ? "carousel_fullscreen" : "signature_fullscreen";
+                            XposedHelpers.setObjectField(cat, "categoryName", halfTitle);
+                            Object clonedCat = XposedHelpers.callMethod(cat, "clone");
+                            if (clonedCat != null) {
+                                XposedHelpers.setObjectField(clonedCat, "categoryType", fullType);
+                                XposedHelpers.setObjectField(clonedCat, "categoryName", fullTitle);
+                                int pri = (Integer) XposedHelpers.callMethod(cat, "getPriority");
+                                XposedHelpers.callMethod(clonedCat, "setPriority", pri + 1);
+                                java.util.ArrayList<Object> origItems =
+                                        (java.util.ArrayList<Object>) XposedHelpers.callMethod(cat, "getItemList");
+                                java.util.ArrayList<Object> fullItems = new java.util.ArrayList<>();
+                                if (origItems != null) {
+                                    for (Object item : origItems) {
+                                        Object copied = cloneRearScreenItemAsFullscreen(item, cl);
+                                        if (copied != null) {
+                                            fullItems.add(copied);
+                                        }
+                                    }
+                                }
+                                if (!fullItems.isEmpty()) {
+                                    XposedHelpers.setObjectField(clonedCat, "itemList", fullItems);
+                                    toInsert.add(clonedCat);
+                                    insertPositions.add(i + 1);
+                                }
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + ": clone fullscreen category in r8s8 failed: " + t);
+                        }
+                    }
+                    for (int k = toInsert.size() - 1; k >= 0; k--) {
+                        int pos = Math.min(list.size(), insertPositions.get(k));
+                        list.add(pos, toInsert.get(k));
+                    }
+                    if (!toInsert.isEmpty()) {
+                        XposedBridge.log(TAG + ": ThemeManager r8s8 injected " + toInsert.size() + " fullscreen group(s)");
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": ThemeManager hooked RearScreenListViewModel.r8s8 for half/full carousel & signature");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": ThemeManager hook RearScreenListViewModel.r8s8 failed: " + t);
+        }
+
+        // 2. Hook ViewHolderRearScreenCategoryItem.ch(holder, view)：点击卡片瞬间判断是半屏还是全屏分组，
+        //    立刻切换 sThemeEditorFullscreenMode，让进入后的 MAMLViewRearContainer 预览框与裁切器按 1208×1392 全屏显示！
+        try {
+            Class<?> vhCls = XposedHelpers.findClass("com.rearScreen.viewholder.ViewHolderRearScreenCategoryItem", cl);
+            XposedBridge.hookAllMethods(vhCls, "ch", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args == null || param.args.length < 1 || param.args[0] == null) {
+                        return;
+                    }
+                    try {
+                        Object item = XposedHelpers.getObjectField(param.args[0], "g");
+                        boolean isFull = false;
+                        if (item != null) {
+                            Bundle extra = (Bundle) XposedHelpers.getObjectField(item, "mExtra");
+                            isFull = extra != null && extra.getBoolean(EXTRA_MADRID_FULLSCREEN_CARD, false);
+                        }
+                        sThemeEditorFullscreenMode = isFull;
+                        XposedBridge.log(TAG + ": ThemeManager clicked card -> previewMode="
+                                + (isFull ? "FULLSCREEN(1208x1392)" : "HALF(1208x738)"));
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + ": ViewHolderRearScreenCategoryItem.ch detect failed: " + t);
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": ThemeManager hooked ViewHolderRearScreenCategoryItem.ch for dynamic preview ratio");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": ThemeManager hook ViewHolderRearScreenCategoryItem.ch failed: " + t);
+        }
+
+        // 回到列表页（RearScreenNewListActivity / RearScreenListActivity）时恢复列表页 3x2 缩略图比例
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    Activity a = (Activity) param.thisObject;
+                    if (a == null) {
+                        return;
+                    }
+                    String cn = a.getClass().getName();
+                    if ((cn.contains("rearScreen") || cn.contains("RearScreen"))
+                            && (cn.contains("ListActivity") || cn.contains("HomeActivity") || cn.contains("SettingActivity"))) {
+                        sThemeEditorFullscreenMode = false;
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+
+        // 3. 将官方背屏页面中的「选择图片」等文案替换为「选择图片、视频和 Live 图」
+        try {
+            XposedHelpers.findAndHookMethod(android.widget.TextView.class, "setText",
+                    CharSequence.class, android.widget.TextView.BufferType.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!sInRearScreenThemePage || param.args == null || param.args.length < 1
+                                    || param.args[0] == null) {
+                                return;
+                            }
+                            String s = param.args[0].toString();
+                            if ("选择图片".equals(s)) {
+                                param.args[0] = "选择图片、视频和 Live 图";
+                            } else if ("更换图片".equals(s)) {
+                                param.args[0] = "更换图片、视频和 Live 图";
+                            } else if ("添加图片".equals(s)) {
+                                param.args[0] = "添加图片、视频和 Live 图";
+                            } else if ("将喜欢的图片设定在背屏展示".equals(s)) {
+                                param.args[0] = "将喜欢的图片、视频或 Live 图设定在背屏展示";
+                            }
+                        }
+                    });
+            XposedBridge.log(TAG + ": ThemeManager hooked TextView.setText for video & Live Photo label");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": ThemeManager hook TextView.setText failed: " + t);
+        }
+    }
+
+    private static Object cloneRearScreenItemAsFullscreen(Object item, ClassLoader cl) {
+        if (item == null || !(item instanceof android.os.Parcelable)) {
+            return null;
+        }
+        // Gson 从 rearScreen.json 反序列化时未提供 applyId（为 null），Kotlin Parcelable.Creator
+        // 构造时会校验 @NotNull String 参数，写入 Parcel 前先兜底为 ""。
+        String[] nonNullStrFields = {"applyId", "resId", "resName", "resPreviewPath", "resType"};
+        for (String f : nonNullStrFields) {
+            try {
+                if (XposedHelpers.getObjectField(item, f) == null) {
+                    XposedHelpers.setObjectField(item, f, "");
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        android.os.Parcel parcel = android.os.Parcel.obtain();
+        try {
+            parcel.writeParcelable((android.os.Parcelable) item, 0);
+            parcel.setDataPosition(0);
+            Object copy = parcel.readParcelable(cl);
+            if (copy != null) {
+                Bundle extra = null;
+                try {
+                    extra = (Bundle) XposedHelpers.getObjectField(copy, "mExtra");
+                } catch (Throwable ignored) {
+                }
+                if (extra == null) {
+                    extra = new Bundle();
+                    XposedHelpers.setObjectField(copy, "mExtra", extra);
+                }
+                extra.putBoolean(EXTRA_MADRID_FULLSCREEN_CARD, true);
+                return copy;
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": cloneRearScreenItemAsFullscreen failed: " + t);
+        } finally {
+            parcel.recycle();
+        }
+        return null;
     }
 
     private static void hookThemeManagerRearBrightness(ClassLoader cl) {

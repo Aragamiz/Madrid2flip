@@ -51,6 +51,10 @@ public final class UnfoldOuterDisplayHook {
     public static final String KEY_FOLDED_FINGERPRINT_REAR = "madrid_folded_fingerprint_rear";
     public static final String KEY_FOLDED_EXIT_TO_LOCK = "madrid_folded_exit_to_lock";
     public static final String KEY_REAR_SWIPE_CAMERA = "madrid_rear_swipe_camera";
+    /** 背屏触摸锁定：展开态外屏作为背屏显示时吞掉外屏全部触摸（0/1，默认 0） */
+    public static final String KEY_REAR_TOUCH_LOCK = "madrid_rear_touch_lock";
+    /** 视频壁纸循环播放：动态壁纸播完立即从头重播，不再停帧（0/1，默认 0） */
+    public static final String KEY_REAR_VIDEO_LOOP = "madrid_rear_video_loop";
     public static final String EXTRA_FOLDED_MODE = "madrid_folded_mode";
 
     private static final float FLIP2_MIN_BRIGHTNESS = 0.000854597f;
@@ -65,6 +69,13 @@ public final class UnfoldOuterDisplayHook {
     private static volatile Context sSystemContext;
     private static volatile ClassLoader sSystemClassLoader;
     private static volatile boolean sReceiverRegistered;
+    /** 开机后首次进入背屏时复位一次背屏中心进程，确保 LSPosed 作用域已就绪、新增 Hook 一定被注入 */
+    private static volatile boolean sSubscreenResetDone = false;
+    /** 背屏触摸锁定开关的短缓存，避免焦点切换高频路径上反复读 Settings */
+    private static volatile long sRearTouchLockCheckedAt = 0L;
+    private static volatile boolean sRearTouchLockCached = false;
+    /** 焦点拦截命中日志的限频时间戳 */
+    private static volatile long sRearFocusGuardLogAt = 0L;
     private static final Handler sMainHandler = new Handler(Looper.getMainLooper());
 
     private UnfoldOuterDisplayHook() {
@@ -80,6 +91,93 @@ public final class UnfoldOuterDisplayHook {
         hookDeviceStateLifecycle(cl);
         hookBackTapShortcut(cl);
         hookHideFoldedWidgets(cl);
+        hookRearTouchFocusGuard(cl);
+    }
+
+    /**
+     * 背屏触摸防误触（输入法场景）：阻止焦点切换到背屏 display。
+     * <p>
+     * 现象：内屏展开、正在输入时触摸背屏，内屏输入法面板会被收起。
+     * 根因：触摸事件由 InputDispatcher 命中背屏窗口后，WMS 会把焦点切到背屏
+     * (DisplayContent.displayId=1)；IMMS 检测到 top focused display 变化，重新计算
+     * IME 目标 display 并收起内屏输入法。app 层的 dispatchTouchEvent Hook 发生在
+     * 焦点切换之后，无法阻止这一步。
+     * <p>
+     * 做法：在焦点切换的源头 DisplayContent.updateFocusedWindowLocked 的 before 中，
+     * 若该 DisplayContent 是背屏(displayId=1)、设备处于展开态(baseState 非 0/1)
+     * 且防误触开关开启，直接 setResult(false) 取消本次焦点切换。
+     * Xposed 返回 false 是系统已有的正常提前返回路径（当前焦点仍 focusable 时系统
+     * 本身就返回 false），不会破坏 WMS 状态，也不会触发 bootloop。
+     * 因为焦点从未交给背屏，输入法目标 display 不变，内屏输入法保持；同时背屏窗口
+     * 依旧照常显示、只是拿不到输入焦点，正符合"防误触"语义。
+     * 关闭开关或合盖时条件不成立，Hook 完全不干预，行为与原生一致。
+     */
+    private static void hookRearTouchFocusGuard(ClassLoader cl) {
+        try {
+            Class<?> dcCls = XposedHelpers.findClass("com.android.server.wm.DisplayContent", cl);
+            XposedBridge.hookAllMethods(dcCls, "updateFocusedWindowLocked", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        Object dc = param.thisObject;
+                        if (dc == null) {
+                            return;
+                        }
+                        // 只针对背屏所在的 DisplayContent
+                        int displayId;
+                        try {
+                            displayId = XposedHelpers.getIntField(dc, "mDisplayId");
+                        } catch (Throwable ignored) {
+                            return;
+                        }
+                        if (displayId != 1) {
+                            return;
+                        }
+                        // 合盖时 display 1 是主外屏，必须允许其正常获取焦点
+                        int base = sCurrentBaseState;
+                        if (base == 0 || base == 1) {
+                            return;
+                        }
+                        // 防误触开关未开启则不干预（读 Settings 带短缓存）
+                        boolean locked = isRearTouchLockedFast();
+                        if (!locked) {
+                            return;
+                        }
+                        long now = System.currentTimeMillis();
+                        if (now - sRearFocusGuardLogAt > 10000L) {
+                            sRearFocusGuardLogAt = now;
+                            XposedBridge.log(TAG + ": rear touch guard BLOCKED focus switch to display 1");
+                        }
+                        param.setResult(false);
+                    } catch (Throwable t) {
+                        // 任何异常都放过，绝不影响焦点系统稳定性
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": hooked DisplayContent.updateFocusedWindowLocked for rear touch focus guard");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": hook rear touch focus guard failed: " + t);
+        }
+    }
+
+    /** 带 250ms 缓存的防误触开关读取，专供焦点切换高频路径使用。 */
+    private static boolean isRearTouchLockedFast() {
+        long now = System.currentTimeMillis();
+        if (now - sRearTouchLockCheckedAt <= 250L) {
+            return sRearTouchLockCached;
+        }
+        Context ctx = sSystemContext;
+        if (ctx == null) {
+            return false;
+        }
+        try {
+            sRearTouchLockCached = Settings.Global.getInt(ctx.getContentResolver(),
+                    KEY_REAR_TOUCH_LOCK, 0) == 1;
+        } catch (Throwable ignored) {
+            sRearTouchLockCached = false;
+        }
+        sRearTouchLockCheckedAt = now;
+        return sRearTouchLockCached;
     }
 
     private static void hookHideFoldedWidgets(ClassLoader cl) {
@@ -426,7 +524,7 @@ public final class UnfoldOuterDisplayHook {
         try {
             Intent it = new Intent(RearScreenNotifyReceiver.ACTION_NOTIFY_REAR_TOGGLED);
             it.setComponent(new ComponentName("io.github.aragamiz.madrid2flip",
-                    "com.collasong.madridsubscreen.RearScreenNotifyReceiver"));
+                    "io.github.aragamiz.madrid2flip.NoticeReceiver"));
             it.putExtra(RearScreenNotifyReceiver.EXTRA_ENABLED, enabled);
             it.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
             ctx.sendBroadcast(it);
@@ -747,6 +845,7 @@ public final class UnfoldOuterDisplayHook {
         if (ctx == null || cl == null) {
             return;
         }
+        ensureSubscreenHookReady(ctx);
         // 二次防呆：合盖状态下绝不允许拉起 state=5，根治合盖外屏黑屏卡死！
         if (sCurrentBaseState == 0 || sCurrentBaseState == 1) {
             XposedBridge.log(TAG + ": aborted enterRearState(" + reason + ") because device is folded (baseId=" + sCurrentBaseState + ")");
@@ -784,6 +883,28 @@ public final class UnfoldOuterDisplayHook {
             sMainHandler.postDelayed(sPendingLaunchRunnable, 450L);
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": enterRearState failed: " + t);
+        }
+    }
+
+    /**
+     * 背屏中心进程在开机阶段往往早于 LSPosed daemon 就绪，导致本次开机内首次进入背屏时
+     * 模块作用域尚未生效（背屏锁定/壁纸循环 Hook 不加载）。这里在开机后第一次拉起背屏前
+     * 主动结束一次该进程，使其在 daemon 就绪后重新 fork，保证 Hook 一定注入。
+     */
+    private static void ensureSubscreenHookReady(Context ctx) {
+        if (sSubscreenResetDone || ctx == null) {
+            return;
+        }
+        sSubscreenResetDone = true;
+        try {
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) {
+                Object ok = XposedHelpers.callMethod(am, "forceStopPackage", PKG_SUBSCREEN);
+                XposedBridge.log(TAG + ": reset subscreencenter once after boot to apply module hooks (ret=" + ok + ")");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": reset subscreencenter failed: " + t);
         }
     }
 

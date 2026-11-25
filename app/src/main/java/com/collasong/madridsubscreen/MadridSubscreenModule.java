@@ -17,8 +17,10 @@ public final class MadridSubscreenModule implements IXposedHookLoadPackage {
             return;
         }
         String pkg = lpparam.packageName;
-        if ("android".equals(pkg)) {
-            XposedBridge.log(TAG + ": loaded in system_server");
+        // 不同 LSPosed 版本对 system_server 的 packageName 上报不一致：
+        // 有的报 "android"，有的报 "system"。两者都要注入，否则系统层 Hook 全部失效。
+        if ("android".equals(pkg) || "system".equals(pkg)) {
+            XposedBridge.log(TAG + ": loaded in system_server (pkg=" + pkg + ")");
             UnfoldOuterDisplayHook.install(lpparam.classLoader);
         } else if ("com.xiaomi.subscreencenter".equals(pkg)) {
             XposedBridge.log(TAG + ": loaded in com.xiaomi.subscreencenter");

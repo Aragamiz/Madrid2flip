@@ -179,6 +179,19 @@ public final class SubscreenCenterHook {
         if (cl == null) {
             return;
         }
+        // === 二次开发（背屏锁定 / 视频壁纸循环）===
+        // 原模块的视口重映射（getRealSize → 1208x738、改写 Activity 视图树、毛玻璃背板、防烧屏位移）
+        // 在 HyperOS 4 / Android 17 上会让 SubScreenLauncher 的窗口拿不到 buffer 而整屏黑掉，
+        // 并与当前已正常工作的外屏显示与自定义壁纸相互冲突。
+        // 这里只安装两项新增能力所需的 Hook，显示相关逻辑一律保持原厂，确保不引入回归。
+        boolean legacyViewport = false;
+        if (!legacyViewport) {
+            installRearTouchLock(cl);
+            installRearWindowTouchable(cl);
+            installRearVideoLoop(cl);
+            XposedBridge.log(TAG + ": touch-lock + wallpaper-loop installed, stock viewport preserved");
+            return;
+        }
         try {
             Class<?> infoCls = XposedHelpers.findClass("miui.util.MiuiMultiDisplayTypeInfo", cl);
             try {
@@ -312,6 +325,12 @@ public final class SubscreenCenterHook {
                     if (!isSubScreenActivity(act.getClass().getName())) {
                         return;
                     }
+                    // 背屏触摸锁定：仅在内屏展开且外屏作为背屏显示（displayId=1）时吞掉外屏全部触摸，
+                    // 合盖全屏模式（displayId=0）与内屏触控完全不受影响
+                    if (isRearTouchLocked(act) && isRearDisplay(act)) {
+                        param.setResult(Boolean.TRUE);
+                        return;
+                    }
                     MotionEvent ev = (MotionEvent) param.args[0];
                     if (ev != null) {
                         int actMask = ev.getActionMasked();
@@ -355,9 +374,420 @@ public final class SubscreenCenterHook {
                 }
             });
 
+            installRearVideoLoop(cl);
+
             XposedBridge.log(TAG + ": camera-aligned viewport + black-area double-tap exit + burn-in shift armed");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": hook Activity viewport failed: " + t);
+            // 触摸/视口 hook 失败时仍要保证壁纸循环可用（其内部逐项 try-catch）
+            installRearVideoLoop(cl);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 背屏触摸锁定 / 视频壁纸循环（新增，均复用既有设置与 Hook 通道）
+    // ------------------------------------------------------------------
+
+    private static final long SETTING_CACHE_MS = 250L;
+    private static volatile boolean sTouchLockEnabled = false;
+    private static volatile long sTouchLockCheckedAt = 0L;
+    private static volatile boolean sVideoLoopEnabled = false;
+    private static volatile long sVideoLoopCheckedAt = 0L;
+
+    private static final java.util.ArrayList<WeakReference<Object>> sVideoViews = new java.util.ArrayList<>();
+
+    /** 外屏（displayId=1）上的背屏 Activity：正是「内屏展开 + 外屏作为背屏显示」的形态。 */
+    private static boolean isRearDisplay(Activity act) {
+        try {
+            Display d = act != null ? act.getDisplay() : null;
+            return d != null && d.getDisplayId() == 1;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * 背屏触摸锁定：内屏展开且外屏作为背屏显示（displayId=1）时吞掉外屏全部触摸。
+     * <p>
+     * 关键：SubScreenLauncher 自己重写了 dispatchTouchEvent（长按唤出卡片视图、双击熄屏等手势
+     * 都在它内部消费），只在父类 Activity 上 Hook 会等到 super 调用时才触发，此时手势早已生效。
+     * 因此必须直接 Hook 子类方法，才能在事件进入视图树之前把它吞掉。
+     */
+    private static void installRearTouchLock(ClassLoader cl) {
+        try {
+            Class<?> launcherCls = XposedHelpers.findClass("com.xiaomi.subscreencenter.SubScreenLauncher", cl);
+            XposedBridge.hookAllMethods(launcherCls, "dispatchTouchEvent", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    Activity act = (Activity) param.thisObject;
+                    if (act == null) {
+                        return;
+                    }
+                    // 仅在「内屏展开 + 外屏作为背屏显示（displayId=1）」时拦截；
+                    // 合盖后 SubScreenLauncher 回到 display 0 作为主外屏，必须保持可触摸。
+                    if (isRearDisplay(act) && isRearTouchLocked(act)) {
+                        param.setResult(Boolean.TRUE);
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": hooked SubScreenLauncher.dispatchTouchEvent for rear touch lock");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": hook SubScreenLauncher.dispatchTouchEvent failed: " + t);
+        }
+
+        // 兜底：其它背屏 Activity 仍走父类分发的场景
+        try {
+            XposedHelpers.findAndHookMethod(Activity.class, "dispatchTouchEvent", MotionEvent.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    Activity act = (Activity) param.thisObject;
+                    if (act == null || !isSubScreenActivity(act.getClass().getName())) {
+                        return;
+                    }
+                    if (isRearDisplay(act) && isRearTouchLocked(act)) {
+                        param.setResult(Boolean.TRUE);
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": hooked Activity.dispatchTouchEvent for rear touch lock (fallback)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": hook rear touch lock fallback failed: " + t);
+        }
+    }
+
+    /** 当前背屏 Activity 引用，供窗口可触摸状态切换使用。 */
+    private static WeakReference<Activity> sRearActRef;
+    private static android.database.ContentObserver sTouchLockObserver;
+    private static Handler sTouchLockHandler;
+    private static Boolean sLastWindowTouchable;
+
+    /**
+     * 锁定开启时把背屏窗口"从触摸命中链里摘出去"。
+     * <p>
+     * 只 Hook dispatchTouchEvent 是不够的：触摸事件在到达 Activity 之前，会先经
+     * InputDispatcher → WindowManagerService 完成窗口命中、焦点与输入法目标更新，
+     * 内屏输入法正是在这个阶段因为"用户点了别处"而收起。
+     * 给窗口加 FLAG_NOT_TOUCHABLE 后，InputDispatcher 直接跳过该窗口，事件无处可去被丢弃，
+     * WindowManager / 输入法层完全看不到这次触摸，输入法不会被收起，
+     * 也不需要再去 Hook InputMethodManagerService 这类侵入性更强的点。
+     */
+    private static void installRearWindowTouchable(ClassLoader cl) {
+        try {
+            Class<?> launcherCls = XposedHelpers.findClass("com.xiaomi.subscreencenter.SubScreenLauncher", cl);
+            XposedBridge.hookAllMethods(launcherCls, "onResume", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Activity act = (Activity) param.thisObject;
+                        if (act == null) {
+                            return;
+                        }
+                        sRearActRef = new WeakReference<>(act);
+                        // Activity 重建后旧状态失效，强制重新套用一次
+                        sLastWindowTouchable = null;
+                        bindTouchLockObserver(act);
+                        // display 切换与窗口添加有延迟，推迟一拍再套用
+                        act.getWindow().getDecorView().postDelayed(
+                                () -> applyRearWindowTouchable(act), 300L);
+                        startTouchLockTicker();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": hooked SubScreenLauncher.onResume for window touchability");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": hook window touchability failed: " + t);
+        }
+    }
+
+    private static void bindTouchLockObserver(Activity act) {
+        if (sTouchLockObserver != null) {
+            return;
+        }
+        try {
+            sTouchLockObserver = new android.database.ContentObserver(new Handler(Looper.getMainLooper())) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    Activity a = sRearActRef != null ? sRearActRef.get() : null;
+                    if (a != null) {
+                        applyRearWindowTouchable(a);
+                    }
+                }
+            };
+            act.getContentResolver().registerContentObserver(
+                    Settings.Global.getUriFor(UnfoldOuterDisplayHook.KEY_REAR_TOUCH_LOCK),
+                    false, sTouchLockObserver);
+            XposedBridge.log(TAG + ": rear touch lock observer registered");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": register touch lock observer failed: " + t);
+        }
+    }
+
+    private static void applyRearWindowTouchable(Activity act) {
+        try {
+            android.view.Window win = act.getWindow();
+            if (win == null || act.isFinishing()) {
+                return;
+            }
+            boolean block = isRearDisplay(act) && isRearTouchLocked(act);
+            boolean touchable = !block;
+            if (sLastWindowTouchable != null && sLastWindowTouchable == touchable) {
+                return;
+            }
+            if (touchable) {
+                win.clearFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
+            } else {
+                win.addFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
+            }
+            sLastWindowTouchable = touchable;
+            XposedBridge.log(TAG + ": rear window touchable=" + touchable);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": apply window touchability failed: " + t);
+        }
+    }
+
+    /** 合盖/展开切换不会重建 Activity，用低频轮询兜住 display 变化引起的状态偏差。 */
+    private static void startTouchLockTicker() {
+        if (sTouchLockHandler != null) {
+            return;
+        }
+        sTouchLockHandler = new Handler(Looper.getMainLooper());
+        sTouchLockHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                Activity a = sRearActRef != null ? sRearActRef.get() : null;
+                if (a != null) {
+                    applyRearWindowTouchable(a);
+                }
+                if (sTouchLockHandler != null) {
+                    sTouchLockHandler.postDelayed(this, 1500L);
+                }
+            }
+        }, 1500L);
+    }
+
+    private static boolean isRearTouchLocked(Context ctx) {
+        long now = System.currentTimeMillis();
+        if (now - sTouchLockCheckedAt > SETTING_CACHE_MS) {
+            boolean v = false;
+            try {
+                Context c = ctx != null ? ctx : currentContext();
+                if (c != null) {
+                    v = Settings.Global.getInt(c.getContentResolver(),
+                            UnfoldOuterDisplayHook.KEY_REAR_TOUCH_LOCK, 0) == 1;
+                }
+            } catch (Throwable ignored) {
+            }
+            if (v != sTouchLockEnabled) {
+                XposedBridge.log(TAG + ": rear touch lock -> " + (v ? "ON (rear touches swallowed)" : "OFF (rear touches restored)"));
+            }
+            sTouchLockEnabled = v;
+            sTouchLockCheckedAt = now;
+        }
+        return sTouchLockEnabled;
+    }
+
+    private static boolean isRearVideoLoopEnabled(Context ctx) {
+        long now = System.currentTimeMillis();
+        if (now - sVideoLoopCheckedAt > SETTING_CACHE_MS) {
+            boolean v = false;
+            try {
+                Context c = ctx != null ? ctx : currentContext();
+                if (c != null) {
+                    v = Settings.Global.getInt(c.getContentResolver(),
+                            UnfoldOuterDisplayHook.KEY_REAR_VIDEO_LOOP, 0) == 1;
+                }
+            } catch (Throwable ignored) {
+            }
+            if (v != sVideoLoopEnabled) {
+                XposedBridge.log(TAG + ": rear video loop -> " + (v ? "ON" : "OFF"));
+                if (!v) {
+                    // 开 -> 关：立刻把在播的播放器恢复为非循环，无需重开背屏
+                    for (Object view : snapshotVideoViews()) {
+                        applyVideoLooping(view, false);
+                    }
+                }
+            }
+            sVideoLoopEnabled = v;
+            sVideoLoopCheckedAt = now;
+        }
+        return sVideoLoopEnabled;
+    }
+
+    /** VideoElement 自身不持有 Context，通过 mView(IVideoHolder).getView() 取所在 View。 */
+    private static Context contextFromVideoElement(Object videoElement) {
+        try {
+            Object holder = XposedHelpers.getObjectField(videoElement, "mView");
+            if (holder != null) {
+                Object v = XposedHelpers.callMethod(holder, "getView");
+                if (v instanceof View) {
+                    Context c = ((View) v).getContext();
+                    if (c != null) {
+                        return c;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return currentContext();
+    }
+
+    private static Context currentContext() {
+        try {
+            Activity a = sTrackedActivityRef != null ? sTrackedActivityRef.get() : null;
+            return a;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void trackVideoView(Object view) {
+        if (view == null) {
+            return;
+        }
+        synchronized (sVideoViews) {
+            for (int i = sVideoViews.size() - 1; i >= 0; i--) {
+                Object v = sVideoViews.get(i).get();
+                if (v == null) {
+                    sVideoViews.remove(i);
+                } else if (v == view) {
+                    return;
+                }
+            }
+            sVideoViews.add(new WeakReference<>(view));
+        }
+    }
+
+    private static java.util.List<Object> snapshotVideoViews() {
+        java.util.ArrayList<Object> out = new java.util.ArrayList<>();
+        synchronized (sVideoViews) {
+            for (int i = sVideoViews.size() - 1; i >= 0; i--) {
+                Object v = sVideoViews.get(i).get();
+                if (v == null) {
+                    sVideoViews.remove(i);
+                } else {
+                    out.add(v);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** 直接对底层 MediaPlayer 设置循环，并同步 MAML 的 mLooping 标记（厂商 setLooping 传参有误，这里按真实意图纠正）。 */
+    private static void applyVideoLooping(Object holder, boolean looping) {
+        if (holder == null) {
+            return;
+        }
+        try {
+            Object mp = XposedHelpers.getObjectField(holder, "mMediaPlayer");
+            if (mp instanceof android.media.MediaPlayer) {
+                ((android.media.MediaPlayer) mp).setLooping(looping);
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            XposedHelpers.setBooleanField(holder, "mLooping", looping);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 视频壁纸循环播放：
+     * 1) 强制 MAML &lt;Video looping="..."&gt; 进入播放器时即为循环（保证首轮就无缝）；
+     * 2) onPrepared 后再补一次 setLooping(true)，覆盖 config 未重新执行的情形；
+     * 3) onCompletion 兜底 seekTo(0)+start()，确保任何情况下都不会停在最后一帧。
+     */
+    private static void installRearVideoLoop(ClassLoader cl) {
+        try {
+            Class<?> veCls = XposedHelpers.findClass("com.miui.maml.elements.video.VideoElement", cl);
+            XposedBridge.hookAllMethods(veCls, "config", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args == null || param.args.length < 1 || !(param.args[0] instanceof Boolean)) {
+                        return;
+                    }
+                    if (!isRearVideoLoopEnabled(contextFromVideoElement(param.thisObject))) {
+                        return;
+                    }
+                    if (!(Boolean) param.args[0]) {
+                        param.args[0] = Boolean.TRUE;
+                        XposedBridge.log(TAG + ": forced VideoElement.config looping=true for rear wallpaper");
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": hooked VideoElement.config for rear wallpaper looping");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": hook VideoElement.config failed: " + t);
+        }
+
+        hookVideoLoopListeners(cl, "com.miui.maml.elements.video.TextureVideoView");
+        hookVideoLoopListeners(cl, "com.miui.maml.elements.video.BaseVideoView");
+    }
+
+    private static void hookVideoLoopListeners(ClassLoader cl, String outerName) {
+        for (int i = 1; i <= 12; i++) {
+            Class<?> cls;
+            try {
+                cls = XposedHelpers.findClass(outerName + "$" + i, cl);
+            } catch (Throwable notFound) {
+                continue;
+            }
+            if (cls == null) {
+                continue;
+            }
+            boolean isPrepared = android.media.MediaPlayer.OnPreparedListener.class.isAssignableFrom(cls);
+            boolean isCompletion = android.media.MediaPlayer.OnCompletionListener.class.isAssignableFrom(cls);
+            if (!isPrepared && !isCompletion) {
+                continue;
+            }
+            XposedBridge.hookAllMethods(cls, isPrepared ? "onPrepared" : "onCompletion", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Object holder;
+                    try {
+                        holder = XposedHelpers.getObjectField(param.thisObject, "this$0");
+                    } catch (Throwable ignored) {
+                        return;
+                    }
+                    if (holder == null) {
+                        return;
+                    }
+                    trackVideoView(holder);
+                    Context ctx = null;
+                    if (holder instanceof View) {
+                        try {
+                            ctx = ((View) holder).getContext();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    if (!isRearVideoLoopEnabled(ctx)) {
+                        return;
+                    }
+                    // onPrepared / onCompletion 都直接对回调参数里的 MediaPlayer 开启循环：
+                    // 只有播放器本身进入 looping，播完才会无缝回到开头（而不是等 onCompletion 再 seek）。
+                    try {
+                        if (param.args != null && param.args.length > 0
+                                && param.args[0] instanceof android.media.MediaPlayer) {
+                            ((android.media.MediaPlayer) param.args[0]).setLooping(true);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    applyVideoLooping(holder, true);
+                    if (isCompletion) {
+                        // onCompletion 结束时播放器停在末尾且 targetState 被置 0，这里立即拉回开头续播
+                        try {
+                            XposedHelpers.callMethod(holder, "seekTo", 0);
+                        } catch (Throwable ignored) {
+                        }
+                        try {
+                            XposedHelpers.callMethod(holder, "start");
+                        } catch (Throwable ignored) {
+                        }
+                        XposedBridge.log(TAG + ": rear wallpaper video ended -> restart from head (looping)");
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": hooked " + outerName + "$" + i + "." + (isPrepared ? "onPrepared" : "onCompletion") + " for rear wallpaper loop");
         }
     }
 

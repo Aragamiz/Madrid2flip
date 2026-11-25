@@ -2229,13 +2229,20 @@ public final class SubscreenCenterHook {
             XposedBridge.log(TAG + ": ThemeManager hook ThirdPartyIntentUtils.cdj failed: " + t);
         }
 
-        // 隐藏 MIX Flip 2 硬件不支持的「背屏息屏显示（AodAssistantController）」入口（合盖走 Flip 2 原厂外屏 AOD）
+        // 隐藏 MIX Flip 2 硬件不支持的「背屏息屏显示（AodAssistantController）」与「背屏截屏（ScreenshotAssistantController）」入口
         try {
             Class<?> aodCtrlCls = XposedHelpers.findClass("com.rearScreen.subscreen.AodAssistantController", cl);
             XposedHelpers.findAndHookMethod(aodCtrlCls, "k", XC_MethodReplacement.returnConstant(Boolean.FALSE));
             XposedBridge.log(TAG + ": ThemeManager hidden unsupported AodAssistantController (rear AOD)");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": ThemeManager hide AodAssistantController failed: " + t);
+        }
+        try {
+            Class<?> ssCtrlCls = XposedHelpers.findClass("com.rearScreen.subscreen.ScreenshotAssistantController", cl);
+            XposedHelpers.findAndHookMethod(ssCtrlCls, "k", XC_MethodReplacement.returnConstant(Boolean.FALSE));
+            XposedBridge.log(TAG + ": ThemeManager hidden ScreenshotAssistantController (rear screenshot)");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": ThemeManager hide ScreenshotAssistantController failed: " + t);
         }
 
         // 修复「个性背屏」亮度条（用 Flip 2 动态浮点映射直连 DisplayManager(1)）并隐藏失效的「阳光屏」开关

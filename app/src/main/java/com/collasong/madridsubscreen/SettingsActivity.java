@@ -7,8 +7,14 @@ import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -53,6 +59,20 @@ public class SettingsActivity extends Activity {
 
     private LinearLayout statusBanner;
     private TextView statusBadge, statusDetail;
+    private Switch swEngine, swRearDisplay;
+    private boolean updatingQuickSwitches = false;
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private SensorManager sensorManager;
+    private SensorEventListener backAlsListener, backProxListener;
+    private volatile Float liveBackLux = null;
+    private volatile Boolean liveBackProxNear = null;
+    private final Runnable bannerTicker = new Runnable() {
+        @Override
+        public void run() {
+            refreshBannerStatus();
+            uiHandler.postDelayed(this, 1200L);
+        }
+    };
     private TextView[] capSegments = new TextView[CAP_VALUES.length];
     private TextView[] scaleSegments = new TextView[SCALE_VALUES.length];
     private TextView[] timeoutSegments = new TextView[TIMEOUT_VALUES.length];
@@ -108,31 +128,77 @@ public class SettingsActivity extends Activity {
         statusDetail.setPadding(0, dp(4), 0, 0);
         statusBanner.addView(statusDetail);
 
-        // 3. 快捷操作卡片
+        // 3. 快捷控制卡片（背屏引擎总开关 + 背屏显示开关）
         addSectionTitle(root, "快捷控制");
-        LinearLayout quickCard = roundedCard(root, cCard, cStroke, 18, 14);
+        LinearLayout quickCard = roundedCard(root, cCard, cStroke, 18, 16);
 
-        LinearLayout row1 = new LinearLayout(this);
-        row1.setOrientation(LinearLayout.HORIZONTAL);
-        addPillButton(row1, "开启展开态背屏", cAccent, Color.WHITE, 0, dp(8), () -> {
-            try {
-                sendBroadcast(new Intent(UnfoldOuterDisplayHook.ACTION_ENTER_REAR_SCREEN));
-            } catch (Throwable ignored) {
-            }
-            runRootCmd("cmd device_state state 5 && sleep 0.4 && am start --display 1 -n com.xiaomi.subscreencenter/.SubScreenLauncher");
-            toast("已开启展开态背屏（双击下方区域或合盖可退出）");
-            statusBanner.postDelayed(this::refreshBannerStatus, 900L);
-        });
-        addPillButton(row1, "关闭背屏", cDangerSoft, cDanger, dp(8), 0, () -> {
-            try {
-                sendBroadcast(new Intent(UnfoldOuterDisplayHook.ACTION_EXIT_REAR_SCREEN));
-            } catch (Throwable ignored) {
-            }
-            runRootCmd("cmd device_state state reset");
-            toast("已关闭背屏并恢复默认外屏");
-            statusBanner.postDelayed(this::refreshBannerStatus, 700L);
-        });
-        quickCard.addView(row1);
+        boolean engineOnInit = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_ENGINE_ENABLED, 1) == 1;
+        swEngine = addSwitchRow(quickCard,
+                "背屏引擎开关",
+                "开启后启用小米 18 背屏调度、手势与自动化；关闭后立即停用背屏并恢复原厂外屏逻辑",
+                engineOnInit,
+                (b, checked) -> {
+                    if (updatingQuickSwitches) {
+                        return;
+                    }
+                    runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_ENGINE_ENABLED + " " + (checked ? "1" : "0"));
+                    if (!checked) {
+                        try {
+                            sendBroadcast(new Intent(UnfoldOuterDisplayHook.ACTION_EXIT_REAR_SCREEN));
+                        } catch (Throwable ignored) {
+                        }
+                        runRootCmd("cmd device_state state reset");
+                        updatingQuickSwitches = true;
+                        if (swRearDisplay != null) {
+                            swRearDisplay.setChecked(false);
+                        }
+                        updatingQuickSwitches = false;
+                        toast("已关闭背屏引擎并恢复原厂外屏");
+                    } else {
+                        toast("已开启背屏引擎，等待开启背屏");
+                    }
+                    refreshBannerStatus();
+                    statusBanner.postDelayed(this::refreshBannerStatus, 700L);
+                });
+
+        addDivider(quickCard);
+
+        swRearDisplay = addSwitchRow(quickCard,
+                "背屏显示开关",
+                "实时开启或关闭展开态小米 18 背屏（双击下方区域或合盖亦可退出）",
+                isRearDisplayOn(),
+                (b, checked) -> {
+                    if (updatingQuickSwitches) {
+                        return;
+                    }
+                    if (checked) {
+                        if (getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_ENGINE_ENABLED, 1) != 1) {
+                            runRootCmd("settings put global " + UnfoldOuterDisplayHook.KEY_REAR_ENGINE_ENABLED + " 1");
+                            updatingQuickSwitches = true;
+                            if (swEngine != null) {
+                                swEngine.setChecked(true);
+                            }
+                            updatingQuickSwitches = false;
+                        }
+                        try {
+                            sendBroadcast(new Intent(UnfoldOuterDisplayHook.ACTION_ENTER_REAR_SCREEN));
+                        } catch (Throwable ignored) {
+                        }
+                        runRootCmd("cmd device_state state 5 && sleep 0.4 && am start --display 1 -n com.xiaomi.subscreencenter/.SubScreenLauncher");
+                        toast("已开启展开态背屏");
+                        refreshBannerStatus();
+                        statusBanner.postDelayed(this::refreshBannerStatus, 900L);
+                    } else {
+                        try {
+                            sendBroadcast(new Intent(UnfoldOuterDisplayHook.ACTION_EXIT_REAR_SCREEN));
+                        } catch (Throwable ignored) {
+                        }
+                        runRootCmd("cmd device_state state reset");
+                        toast("已关闭背屏");
+                        refreshBannerStatus();
+                        statusBanner.postDelayed(this::refreshBannerStatus, 700L);
+                    }
+                });
 
         // 3.5 按键与手势触发卡片
         addSectionTitle(root, "按键与手势触发");
@@ -465,34 +531,169 @@ public class SettingsActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        registerLiveStatusSensors();
         refreshBannerStatus();
+        uiHandler.removeCallbacks(bannerTicker);
+        uiHandler.postDelayed(bannerTicker, 1200L);
     }
 
-    private void refreshBannerStatus() {
-        if (statusBanner == null || statusBadge == null) {
-            return;
-        }
-        boolean rearOn = false;
+    @Override
+    protected void onPause() {
+        super.onPause();
+        uiHandler.removeCallbacks(bannerTicker);
+        unregisterLiveStatusSensors();
+    }
+
+    private boolean isRearDisplayOn() {
         try {
             android.hardware.display.DisplayManager dm =
                     (android.hardware.display.DisplayManager) getSystemService(DISPLAY_SERVICE);
             if (dm != null) {
                 android.view.Display d1 = dm.getDisplay(1);
                 if (d1 != null && d1.getState() == android.view.Display.STATE_ON) {
-                    rearOn = true;
+                    return true;
                 }
             }
         } catch (Throwable ignored) {
         }
-        int fill = rearOn ? cOkSoft : cWarnSoft;
-        int accent = rearOn ? cOk : cWarn;
+        return false;
+    }
+
+    private void registerLiveStatusSensors() {
+        unregisterLiveStatusSensors();
+        try {
+            sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+            if (sensorManager == null) {
+                return;
+            }
+            Sensor backAls = findSensorByType(sensorManager, 33171055);
+            if (backAls == null) {
+                backAls = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT);
+            }
+            if (backAls != null) {
+                backAlsListener = new SensorEventListener() {
+                    @Override
+                    public void onSensorChanged(SensorEvent event) {
+                        if (event != null && event.values != null && event.values.length > 0) {
+                            liveBackLux = event.values[0];
+                        }
+                    }
+
+                    @Override
+                    public void onAccuracyChanged(Sensor sensor, int accuracy) {
+                    }
+                };
+                sensorManager.registerListener(backAlsListener, backAls, SensorManager.SENSOR_DELAY_UI);
+            }
+            Sensor backProx = findSensorByType(sensorManager, 33171124);
+            final boolean rawProx = backProx != null;
+            if (backProx == null) {
+                backProx = findSensorByType(sensorManager, 33171123);
+            }
+            if (backProx != null) {
+                backProxListener = new SensorEventListener() {
+                    @Override
+                    public void onSensorChanged(SensorEvent event) {
+                        if (event != null && event.values != null && event.values.length > 0) {
+                            liveBackProxNear = rawProx ? (event.values[0] >= 900f) : (event.values[0] < 1.0f);
+                        }
+                    }
+
+                    @Override
+                    public void onAccuracyChanged(Sensor sensor, int accuracy) {
+                    }
+                };
+                sensorManager.registerListener(backProxListener, backProx, SensorManager.SENSOR_DELAY_UI);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void unregisterLiveStatusSensors() {
+        try {
+            if (sensorManager != null) {
+                if (backAlsListener != null) {
+                    sensorManager.unregisterListener(backAlsListener);
+                }
+                if (backProxListener != null) {
+                    sensorManager.unregisterListener(backProxListener);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        backAlsListener = null;
+        backProxListener = null;
+    }
+
+    private Sensor findSensorByType(SensorManager sm, int type) {
+        try {
+            for (Sensor s : sm.getSensorList(Sensor.TYPE_ALL)) {
+                if (s.getType() == type && !s.isWakeUpSensor()) {
+                    return s;
+                }
+            }
+            for (Sensor s : sm.getSensorList(Sensor.TYPE_ALL)) {
+                if (s.getType() == type) {
+                    return s;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private void refreshBannerStatus() {
+        if (statusBanner == null || statusBadge == null || statusDetail == null) {
+            return;
+        }
+        boolean engineOn = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_ENGINE_ENABLED, 1) == 1;
+        boolean rearOn = isRearDisplayOn();
+        boolean stockFs = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_STOCK_FULLSCREEN, 0) == 1;
+        boolean glassExt = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_FULLSCREEN, 0) == 1;
+        boolean touchLocked = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_TOUCH_LOCK, 0) == 1;
+        boolean tableOff = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_TABLE_OFF, 1) == 1;
+        int capPct = getGlobalInt(UnfoldOuterDisplayHook.KEY_REAR_BRIGHTNESS_CAP, 70);
+
+        updatingQuickSwitches = true;
+        if (swEngine != null && swEngine.isChecked() != engineOn) {
+            swEngine.setChecked(engineOn);
+        }
+        if (swRearDisplay != null && swRearDisplay.isChecked() != rearOn) {
+            swRearDisplay.setChecked(rearOn);
+        }
+        updatingQuickSwitches = false;
+
+        int fill;
+        int accent;
+        String title;
+        if (!engineOn) {
+            fill = cDangerSoft;
+            accent = cDanger;
+            title = "●  背屏引擎已关闭";
+        } else if (rearOn) {
+            fill = cOkSoft;
+            accent = cOk;
+            title = "●  小米 18 背屏运行中";
+        } else {
+            fill = cWarnSoft;
+            accent = cWarn;
+            title = "●  背屏引擎就绪，等待开启背屏";
+        }
+
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(fill);
         bg.setCornerRadius(dp(18));
         bg.setStroke(dp(1), accent);
         statusBanner.setBackground(bg);
         statusBadge.setTextColor(accent);
-        statusBadge.setText(rearOn ? "●  小米 18 背屏已开启" : "●  模块就绪，等待开启背屏");
+        statusBadge.setText(title);
+
+        String viewportText = stockFs ? "全屏 1208×1392" : (glassExt ? "半屏 1208×738·毛玻璃" : "半屏 1208×738");
+        String touchText = touchLocked ? "已锁定" : "可触摸";
+        String alsText = liveBackLux != null ? (Math.round(liveBackLux) + " lx / 上限" + capPct + "%") : ("上限" + capPct + "%");
+        String proxState = liveBackProxNear == null ? "待采样" : (liveBackProxNear ? "遮挡" : "无遮挡");
+        String proxText = proxState + (tableOff ? "(贴桌关屏开)" : "(贴桌关屏关)");
+        statusDetail.setText("视口：" + viewportText + " · 触摸：" + touchText + "\n背面光感：" + alsText + " · 背面接近：" + proxText);
     }
 
     /** 检测是否缺少配套 KSU 资源模块（com.xiaomi.subscreencenter）或缺少 Root 权限，弹窗引导安装与授权。 */
@@ -692,8 +893,8 @@ public class SettingsActivity extends Activity {
         parent.addView(div);
     }
 
-    private void addSwitchRow(LinearLayout parent, String title, String summary, boolean checked,
-                              android.widget.CompoundButton.OnCheckedChangeListener onChange) {
+    private Switch addSwitchRow(LinearLayout parent, String title, String summary, boolean checked,
+                                android.widget.CompoundButton.OnCheckedChangeListener onChange) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -732,6 +933,7 @@ public class SettingsActivity extends Activity {
         row.addView(textCol);
         row.addView(sw);
         parent.addView(row);
+        return sw;
     }
 
     private int indexOf(int[] arr, int val, int defIdx) {

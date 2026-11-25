@@ -71,6 +71,8 @@ public final class UnfoldOuterDisplayHook {
     public static final String KEY_HALF_OPEN_INNER_OFF = "madrid_half_open_inner_off";
     /** 翻转/弯折双摄避让方式：0=贴左避让(默认), 1=居中满幅, 2=关闭翻转保持0° */
     public static final String KEY_REAR_FLIP_ALIGN = "madrid_rear_flip_align";
+    /** 背屏引擎总开关：0=关闭背屏引擎(拦截全部自动/手势拉起), 1=开启(默认) */
+    public static final String KEY_REAR_ENGINE_ENABLED = "madrid_rear_engine_enabled";
     public static final String EXTRA_FOLDED_MODE = "madrid_folded_mode";
 
     private static final float FLIP2_MIN_BRIGHTNESS = 0.000854597f;
@@ -299,8 +301,9 @@ public final class UnfoldOuterDisplayHook {
         }
         boolean enabled;
         try {
-            enabled = Settings.Global.getInt(ctx.getContentResolver(),
-                    KEY_HALF_OPEN_INNER_OFF, 0) == 1;
+            enabled = isRearEngineEnabled(ctx)
+                    && Settings.Global.getInt(ctx.getContentResolver(),
+                            KEY_HALF_OPEN_INNER_OFF, 0) == 1;
         } catch (Throwable ignored) {
             enabled = false;
         }
@@ -1140,10 +1143,25 @@ public final class UnfoldOuterDisplayHook {
         sMainHandler.postDelayed(sPendingEnterRunnable, delayMs);
     }
 
+    private static boolean isRearEngineEnabled(Context ctx) {
+        if (ctx == null) {
+            return true;
+        }
+        try {
+            return Settings.Global.getInt(ctx.getContentResolver(), KEY_REAR_ENGINE_ENABLED, 1) == 1;
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
     private static void enterRearState(String reason) {
         Context ctx = sSystemContext;
         ClassLoader cl = sSystemClassLoader;
         if (ctx == null || cl == null) {
+            return;
+        }
+        if (!isRearEngineEnabled(ctx)) {
+            XposedBridge.log(TAG + ": aborted enterRearState(" + reason + ") because rear engine is disabled");
             return;
         }
         // 二次防呆：合盖状态下绝不允许拉起 state=5，根治合盖外屏黑屏卡死！

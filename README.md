@@ -4,6 +4,8 @@
 
 > **前置依赖（配套系统资源模块）**
 > 仅安装 LSPosed 模块无法点亮小米 18 背屏，请先在 KernelSU / Magisk 中刷入配套的小米 18 背屏系统资源模块（`madrid_subscreen_port_v1.0.0.zip`，用于挂载 `/product/app/subscreencenter`、`/product/media/rearscreen`、`/product/etc/precust_theme/theme/.data`），并授予本应用 Root 权限。安装包与配套资源模块均可在 [Releases 页面](https://github.com/Aragamiz/Madrid2flip/releases) 直接下载；本仓库源码仅包含 Xposed 适配模块本身。
+>
+> **挂载环境提示**：测试环境中使用 **Magic Mount RS** 与 **Zygisk Next** 挂载背屏附加资源模块；如果刷入后仍提示未检测到 KSU 背屏模块，请依次检查 **Magic Mount RS**、**Zygisk Next** 与 **小米 18 背屏资源模块（`madrid_subscreen_port_v1.0.0.zip`）** 这三个模块是否正常安装并启用。
 
 ## 核心特性（v2.0.0）
 

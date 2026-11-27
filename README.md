@@ -24,10 +24,19 @@
 
 ## 安装与使用步骤
 
-1. 在 **KernelSU / Magisk** 中刷入 `madrid_subscreen_port_v1.0.0.zip` 并重启手机；
-2. 安装本模块 APK（`io.github.aragamiz.madrid2flip_v2.0.0.apk`），在 **LSPosed** 中启用并勾选下方推荐作用域；
+1. 先在 **KernelSU / Magisk** 中安装并启用 **Magic Mount RS** 与 **Zygisk Next**，确认生效后再刷入 `madrid_subscreen_port_v1.0.0.zip` 并重启手机；
+2. 安装本模块 APK（`io.github.aragamiz.madrid2flip_v2.0.0.apk`），在 **LSPosed** 中启用并**务必勾选下方全部 7 个推荐作用域（尤其是 `com.xiaomi.subscreencenter`）**；
 3. 在 **KernelSU** 超级用户列表中授予「Madrid(小米18)背屏移植flip2」Root 权限，重启一次手机使 `system_server` Hook 生效；
 4. 打开模块 App，顶部状态横幅实时同步引擎/背屏状态、半屏/全屏视口、背面触摸状态及背面光感与接近传感器状态（缺少 KSU 模块或 Root 权限时会自动弹窗引导），通过「背屏引擎开关」「背屏显示开关」即可随时启停；在「系统设置 → 个性背屏」即可自定义半屏/全屏相册轮播、签名、萌宠与 AI 应用卡。
+
+## 常见问题排查（必看）
+
+- **提示未检测到 KSU 背屏模块 / 系统里找不到 `com.xiaomi.subscreencenter`**：
+  - 必须**先安装并启用 Magic Mount RS 与 Zygisk Next**，再刷入 `madrid_subscreen_port_v1.0.0.zip` 并重启；
+  - 如果此前是先刷了背屏资源模块、后装的 Magic Mount RS，可能导致模块目录软链结构异常而未被挂载，请在保持 Magic Mount RS 启用状态下**卸载并重新刷入 `madrid_subscreen_port_v1.0.0.zip`**，再重启手机。
+- **已挂载背屏模块，但开启背屏瞬间闪退 / 无画面（`LoadedApk` / `Resources.getConfiguration()` 空指针）**：
+  - 通常是 **LSPosed 漏勾了 `com.xiaomi.subscreencenter`** 所致：Zygisk Next 会对不在 LSPosed 作用域内的应用执行卸载（`umount`），把 `com.xiaomi.subscreencenter` 自身挂载的 APK 卸掉导致启动秒崩；
+  - 解决方法：在 **LSPosed 中勾选 `com.xiaomi.subscreencenter`** 并重启；若同时安装了月虹隐藏（`YH_YC`）、悲伤压缩包（`bszip`）等环境隐藏模块，也请将 `com.xiaomi.subscreencenter` 从隐藏/卸载列表中放行（或在 KernelSU 超级用户中为 `com.xiaomi.subscreencenter` 关闭「卸载模块」）。
 
 ## 推荐作用域（LSPosed）
 
